@@ -273,14 +273,14 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
                 d.dispatchEvent(new MouseEvent("click",     {bubbles:true,view:window}));
             }
         """)
-        page.wait_for_function('() => !document.querySelector("input[type=password]")', timeout=15000)
+        page.wait_for_function('() => !document.querySelector("input[type=password]")', timeout=30000)
         # Wait for main menu tile to appear instead of fixed sleep
         page.wait_for_function(
             '() => Array.from(document.querySelectorAll("*")).some('
             '  e => e.textContent.toLowerCase().includes("consulta") && '
             '       e.textContent.toLowerCase().includes("tramites") && '
             '       e.offsetParent !== null)',
-            timeout=10000
+            timeout=20000
         )
 
         # ── 2. Consulta Avanzada tile ─────────────────────────────────────────
@@ -296,7 +296,7 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
         # Wait for the folio search form to appear
         page.wait_for_function(
             '() => Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]").length > 0',
-            timeout=10000
+            timeout=20000
         )
 
         # ── 3. Escribir folio real via CDP fill (not ExtJS setValue) ──────────
@@ -309,7 +309,7 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
         # Wait for "Ver Agregado" to appear instead of fixed sleep
         page.wait_for_function(
             '() => Array.from(document.querySelectorAll("*")).some(e => e.textContent.trim() === "Ver Agregado")',
-            timeout=15000
+            timeout=30000
         )
 
         # ── 5. Click Ver Agregado ─────────────────────────────────────────────
@@ -327,7 +327,7 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
         # Wait for iframe to appear instead of fixed sleep
         page.wait_for_function(
             '() => document.querySelector("iframe") !== null',
-            timeout=15000
+            timeout=30000
         )
 
         # ── 6. Obtener URL del PDF desde el visor ─────────────────────────────
