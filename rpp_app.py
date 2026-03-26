@@ -334,11 +334,27 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
                     try {
                         const iframe = document.querySelector("iframe");
                         if (!iframe) return null;
+
+                        // 1. PDFViewerApplication.url (most reliable, needs time to load)
                         try {
-                            const u = iframe.contentWindow.PDFViewerApplication.url;
-                            if (u) return u;
-                        } catch(e2) {}
-                        return iframe.src || null;
+                            const app = iframe.contentWindow.PDFViewerApplication;
+                            if (app && app.url) {
+                                return new URL(app.url, window.location.href).href;
+                            }
+                        } catch(e) {}
+
+                        // 2. Parse file= query param from iframe src (pdf.js viewer pattern)
+                        try {
+                            const iSrc = new URL(iframe.src, window.location.href);
+                            const filePdf = iSrc.searchParams.get('file');
+                            if (filePdf) return new URL(filePdf, iframe.src).href;
+                        } catch(e) {}
+
+                        // 3. iframe src only if it is itself a PDF
+                        if (iframe.src && iframe.src.toLowerCase().includes('.pdf')) {
+                            return new URL(iframe.src, window.location.href).href;
+                        }
+                        return null;
                     } catch(e) { return null; }
                 })()
             """)
