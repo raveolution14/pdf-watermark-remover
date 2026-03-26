@@ -332,24 +332,26 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
             raise ValueError("STEP5: 'Ver Agregado' no apareció — folio no encontrado o búsqueda falló")
 
         # ── 5. Click Ver Agregado ─────────────────────────────────────────────
-        # Try ExtJS button click first (same pattern as Buscar)
         ver_found = page.evaluate("""
             (() => {
-                // Try ExtJS button component
-                const extBtns = Ext.ComponentQuery.query('button');
-                const extBtn = extBtns.find(b => b.text && b.text.trim() === 'Ver Agregado');
-                if (extBtn && extBtn.el) {
-                    const d = extBtn.el.dom;
-                    d.dispatchEvent(new MouseEvent('mousedown', {bubbles:true,view:window}));
-                    d.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true,view:window}));
-                    d.dispatchEvent(new MouseEvent('click',     {bubbles:true,view:window}));
-                    return 'extjs';
-                }
-                // Fallback: find innermost DOM element with exact text
-                const all = Array.from(document.querySelectorAll('a,button,span,div'))
+                // Try ExtJS fireHandler first (most reliable for headless)
+                try {
+                    const extBtns = Ext.ComponentQuery.query('button');
+                    const extBtn = extBtns.find(b => b.text && b.text.trim() === 'Ver Agregado');
+                    if (extBtn) {
+                        if (extBtn.handler) { extBtn.handler.call(extBtn.scope || extBtn, extBtn); return 'handler'; }
+                        if (extBtn.fireEvent) { extBtn.fireEvent('click', extBtn); return 'fireEvent'; }
+                    }
+                } catch(e) {}
+                // Fallback: simple .click() on innermost matching DOM element
+                const all = Array.from(document.querySelectorAll('*'))
+                    .filter(e => e.textContent.trim() === 'Ver Agregado' && e.children.length === 0);
+                if (all.length > 0) { all[0].click(); return 'leaf-click'; }
+                // Wider fallback
+                const wide = Array.from(document.querySelectorAll('a,button,span,div'))
                     .filter(e => e.textContent.trim() === 'Ver Agregado')
                     .sort((a, b) => a.textContent.length - b.textContent.length);
-                if (all.length > 0) { all[0].click(); return 'dom'; }
+                if (wide.length > 0) { wide[0].click(); return 'wide-click'; }
                 return false;
             })()
         """)
