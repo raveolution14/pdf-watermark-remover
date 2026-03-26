@@ -260,10 +260,13 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
             'Ext.ComponentQuery.query("textfield[name=userName]").length > 0',
             timeout=20000
         )
-        page.evaluate(f'Ext.ComponentQuery.query("textfield[name=userName]")[0].setValue("{RPP_USER}")')
-        page.evaluate(f'Ext.ComponentQuery.query("textfield[name=password]")[0].setValue("{RPP_PASS}")')
-        page.wait_for_timeout(500)
-        # Click Aceptar via DOM (ExtJS fireHandler doesn't work headless)
+        # Use fill() on real DOM inputs (more reliable than ExtJS setValue)
+        user_id = page.evaluate('Ext.ComponentQuery.query("textfield[name=userName]")[0].getInputId()')
+        pwd_id  = page.evaluate('Ext.ComponentQuery.query("textfield[name=password]")[0].getInputId()')
+        page.fill(f'#{user_id}', RPP_USER)
+        page.fill(f'#{pwd_id}',  RPP_PASS)
+        page.wait_for_timeout(300)
+        # Submit: try DOM click on Aceptar button first
         page.evaluate("""
             const lb = Ext.ComponentQuery.query("button[text=Aceptar]").find(b => !b.up("messagebox"));
             if (lb && lb.el) {
@@ -273,11 +276,9 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
                 d.dispatchEvent(new MouseEvent("click",     {bubbles:true,view:window}));
             }
         """)
-        page.wait_for_timeout(1000)
-        # Fallback: if password field still visible, try pressing Enter on it
-        still_visible = page.evaluate('!!document.querySelector("input[type=password]")')
-        if still_visible:
-            pwd_id = page.evaluate('Ext.ComponentQuery.query("textfield[name=password]")[0].getInputId()')
+        page.wait_for_timeout(800)
+        # Fallback: press Enter on password field if still on login screen
+        if page.evaluate('!!document.querySelector("input[type=password]")'):
             page.press(f'#{pwd_id}', 'Enter')
         try:
             page.wait_for_function('() => !document.querySelector("input[type=password]")', timeout=30000)
