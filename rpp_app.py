@@ -273,15 +273,21 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
                 d.dispatchEvent(new MouseEvent("click",     {bubbles:true,view:window}));
             }
         """)
-        page.wait_for_function('() => !document.querySelector("input[type=password]")', timeout=30000)
+        try:
+            page.wait_for_function('() => !document.querySelector("input[type=password]")', timeout=30000)
+        except Exception:
+            raise ValueError("STEP2: login no completó (password field sigue visible)")
         # Wait for main menu tile to appear instead of fixed sleep
-        page.wait_for_function(
-            '() => Array.from(document.querySelectorAll("*")).some('
-            '  e => e.textContent.toLowerCase().includes("consulta") && '
-            '       e.textContent.toLowerCase().includes("tramites") && '
-            '       e.offsetParent !== null)',
-            timeout=20000
-        )
+        try:
+            page.wait_for_function(
+                '() => Array.from(document.querySelectorAll("*")).some('
+                '  e => e.textContent.toLowerCase().includes("consulta") && '
+                '       e.textContent.toLowerCase().includes("tramites") && '
+                '       e.offsetParent !== null)',
+                timeout=20000
+            )
+        except Exception:
+            raise ValueError("STEP3: menú principal no apareció")
 
         # ── 2. Consulta Avanzada tile ─────────────────────────────────────────
         # Note: site has a typo — "avazada" not "avanzada"
@@ -294,10 +300,13 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
             if (el) el.click();
         """)
         # Wait for the folio search form to appear
-        page.wait_for_function(
-            '() => Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]").length > 0',
-            timeout=20000
-        )
+        try:
+            page.wait_for_function(
+                '() => Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]").length > 0',
+                timeout=20000
+            )
+        except Exception:
+            raise ValueError("STEP4: formulario de folio no apareció")
 
         # ── 3. Escribir folio real via CDP fill (not ExtJS setValue) ──────────
         input_id = page.evaluate('Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]")[0].getInputId()')
@@ -307,10 +316,13 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
         # ── 4. Click Buscar ───────────────────────────────────────────────────
         _ext_dom_click(page, 'Buscar')
         # Wait for "Ver Agregado" to appear instead of fixed sleep
-        page.wait_for_function(
-            '() => Array.from(document.querySelectorAll("*")).some(e => e.textContent.trim() === "Ver Agregado")',
-            timeout=30000
-        )
+        try:
+            page.wait_for_function(
+                '() => Array.from(document.querySelectorAll("*")).some(e => e.textContent.trim() === "Ver Agregado")',
+                timeout=30000
+            )
+        except Exception:
+            raise ValueError("STEP5: 'Ver Agregado' no apareció — folio no encontrado o búsqueda falló")
 
         # ── 5. Click Ver Agregado ─────────────────────────────────────────────
         ver_found = page.evaluate("""
@@ -325,10 +337,13 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
             browser.close()
             raise ValueError("No se encontró el folio real en el registro")
         # Wait for iframe to appear instead of fixed sleep
-        page.wait_for_function(
-            '() => document.querySelector("iframe") !== null',
-            timeout=30000
-        )
+        try:
+            page.wait_for_function(
+                '() => document.querySelector("iframe") !== null',
+                timeout=30000
+            )
+        except Exception:
+            raise ValueError("STEP6: iframe del PDF no apareció")
 
         # ── 6. Obtener URL del PDF desde el visor ─────────────────────────────
         pdf_url = None
