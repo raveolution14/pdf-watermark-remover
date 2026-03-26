@@ -11,10 +11,7 @@ services:
 
   - type: web
     name: rpp-consulta
-    runtime: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium
-    startCommand: gunicorn rpp_app:app
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     plan: free
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
