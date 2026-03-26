@@ -202,7 +202,18 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-dev-shm-usage']
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-zygote',
+                '--single-process',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-sync',
+                '--no-first-run',
+                '--mute-audio',
+            ]
         )
         context = browser.new_context(
             ignore_https_errors=True,
