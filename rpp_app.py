@@ -8,8 +8,10 @@ import io
 import threading
 import webbrowser
 import os
+import uuid
+import time
 
-from flask import Flask, request, send_file, render_template_string
+from flask import Flask, request, send_file, render_template_string, jsonify
 from playwright.sync_api import sync_playwright
 
 # Reutilizamos el removedor de marcas de agua
@@ -147,29 +149,50 @@ async function buscar() {
   status.innerHTML = 'Buscando folio <b>' + folio + '</b>...<div class="bar"><div class="fill"></div></div>';
 
   try {
-    const res  = await fetch('/buscar', {
+    const res = await fetch('/buscar', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({folio})
     });
-
     if (!res.ok) {
       const err = await res.json().catch(() => ({error: 'Error desconocido'}));
       status.className = 'error';
       status.innerHTML = '&#10060; ' + err.error;
-    } else {
-      const blob   = await res.blob();
-      const url    = URL.createObjectURL(blob);
-      const dlName = 'folio_' + folio + '_sin_marca.pdf';
-      status.className = 'success';
-      status.innerHTML = '&#10003; Documento listo — <a class="dl-btn" href="' + url + '" download="' + dlName + '">&#11015; Descargar PDF</a>';
+      btn.disabled = false;
+      return;
     }
+    const {job_id} = await res.json();
+
+    // Poll until done
+    const poll = setInterval(async () => {
+      try {
+        const sr = await fetch('/status/' + job_id);
+        const s  = await sr.json();
+        if (s.status === 'done') {
+          clearInterval(poll);
+          const dlName = 'folio_' + folio + '_sin_marca.pdf';
+          status.className = 'success';
+          status.innerHTML = '&#10003; Documento listo — <a class="dl-btn" href="/download/' + job_id + '" download="' + dlName + '">&#11015; Descargar PDF</a>';
+          btn.disabled = false;
+        } else if (s.status === 'error') {
+          clearInterval(poll);
+          status.className = 'error';
+          status.innerHTML = '&#10060; ' + s.error;
+          btn.disabled = false;
+        }
+      } catch(e) {
+        clearInterval(poll);
+        status.className = 'error';
+        status.innerHTML = '&#10060; Error de red: ' + e.message;
+        btn.disabled = false;
+      }
+    }, 3000);
+
   } catch(e) {
     status.className = 'error';
     status.innerHTML = '&#10060; Error de red: ' + e.message;
+    btn.disabled = false;
   }
-
-  btn.disabled = false;
 }
 
 document.getElementById('folio').addEventListener('keydown', e => {
@@ -340,6 +363,16 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
     return bytes(pdf_bytes)
 
 
+# ── Job store ─────────────────────────────────────────────────────────────────
+
+_jobs: dict = {}  # job_id -> {status, pdf, error, folio, ts}
+
+def _cleanup_old_jobs():
+    cutoff = time.time() - 600  # 10 min
+    for jid in list(_jobs):
+        if _jobs[jid].get('ts', 0) < cutoff:
+            del _jobs[jid]
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -354,19 +387,47 @@ def buscar():
     if not folio:
         return {'error': 'Folio real requerido'}, 400
 
-    try:
-        raw_pdf   = fetch_pdf_for_folio(folio)
-        clean_pdf = remove_watermarks(raw_pdf)
-        return send_file(
-            io.BytesIO(clean_pdf),
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=f'folio_{folio}_sin_marca.pdf',
-        )
-    except ValueError as e:
-        return {'error': str(e)}, 404
-    except Exception as e:
-        return {'error': f'Error: {e}'}, 500
+    _cleanup_old_jobs()
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {'status': 'running', 'pdf': None, 'error': None,
+                     'folio': folio, 'ts': time.time()}
+
+    def run():
+        try:
+            raw_pdf   = fetch_pdf_for_folio(folio)
+            clean_pdf = remove_watermarks(raw_pdf)
+            _jobs[job_id].update({'status': 'done', 'pdf': clean_pdf})
+        except ValueError as e:
+            _jobs[job_id].update({'status': 'error', 'error': str(e)})
+        except Exception as e:
+            _jobs[job_id].update({'status': 'error', 'error': f'Error: {e}'})
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/status/<job_id>')
+def job_status(job_id):
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({'status': 'error', 'error': 'Job no encontrado'}), 404
+    if job['status'] == 'error':
+        return jsonify({'status': 'error', 'error': job['error']})
+    return jsonify({'status': job['status']})
+
+
+@app.route('/download/<job_id>')
+def download(job_id):
+    job = _jobs.get(job_id)
+    if not job or job['status'] != 'done' or not job['pdf']:
+        return jsonify({'error': 'PDF no disponible'}), 404
+    folio = job.get('folio', 'folio')
+    return send_file(
+        io.BytesIO(job['pdf']),
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=f'folio_{folio}_sin_marca.pdf',
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
