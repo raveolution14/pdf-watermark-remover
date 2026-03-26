@@ -331,38 +331,32 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
         except Exception:
             raise ValueError("STEP5: 'Ver Agregado' no apareció — folio no encontrado o búsqueda falló")
 
-        # ── 5. Click Ver Agregado ─────────────────────────────────────────────
-        ver_found = page.evaluate("""
-            (() => {
-                // Try ExtJS fireHandler first (most reliable for headless)
-                try {
-                    const extBtns = Ext.ComponentQuery.query('button');
-                    const extBtn = extBtns.find(b => b.text && b.text.trim() === 'Ver Agregado');
-                    if (extBtn) {
-                        if (extBtn.handler) { extBtn.handler.call(extBtn.scope || extBtn, extBtn); return 'handler'; }
-                        if (extBtn.fireEvent) { extBtn.fireEvent('click', extBtn); return 'fireEvent'; }
-                    }
-                } catch(e) {}
-                // Fallback: simple .click() on innermost matching DOM element
-                const all = Array.from(document.querySelectorAll('*'))
-                    .filter(e => e.textContent.trim() === 'Ver Agregado' && e.children.length === 0);
-                if (all.length > 0) { all[0].click(); return 'leaf-click'; }
-                // Wider fallback
-                const wide = Array.from(document.querySelectorAll('a,button,span,div'))
-                    .filter(e => e.textContent.trim() === 'Ver Agregado')
-                    .sort((a, b) => a.textContent.length - b.textContent.length);
-                if (wide.length > 0) { wide[0].click(); return 'wide-click'; }
-                return false;
-            })()
-        """)
+        # ── 5. Click Ver Agregado via Playwright native click ─────────────────
+        try:
+            page.get_by_text("Ver Agregado", exact=True).first.click(timeout=5000)
+            ver_found = 'playwright-click'
+        except Exception:
+            # Fallback: JS click on leaf element
+            ver_found = page.evaluate("""
+                (() => {
+                    const all = Array.from(document.querySelectorAll('*'))
+                        .filter(e => e.textContent.trim() === 'Ver Agregado' && e.children.length === 0);
+                    if (all.length > 0) { all[0].click(); return 'leaf-click'; }
+                    const wide = Array.from(document.querySelectorAll('a,button,span,div'))
+                        .filter(e => e.textContent.trim() === 'Ver Agregado')
+                        .sort((a, b) => a.textContent.length - b.textContent.length);
+                    if (wide.length > 0) { wide[0].click(); return 'wide-click'; }
+                    return false;
+                })()
+            """)
         if not ver_found:
             browser.close()
             raise ValueError("No se encontró el folio real en el registro")
-        # Wait for iframe to appear instead of fixed sleep
+        # Wait for iframe to appear
         try:
             page.wait_for_function(
                 '() => document.querySelector("iframe") !== null',
-                timeout=30000
+                timeout=45000
             )
         except Exception:
             raise ValueError(f"STEP6: iframe del PDF no apareció (click method: {ver_found})")
