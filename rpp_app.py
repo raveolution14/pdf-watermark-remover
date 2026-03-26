@@ -332,11 +332,24 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
             raise ValueError("STEP5: 'Ver Agregado' no apareció — folio no encontrado o búsqueda falló")
 
         # ── 5. Click Ver Agregado ─────────────────────────────────────────────
+        # Try ExtJS button click first (same pattern as Buscar)
         ver_found = page.evaluate("""
             (() => {
-                const el = Array.from(document.querySelectorAll("*"))
-                    .find(e => e.textContent.trim() === "Ver Agregado");
-                if (el) { el.click(); return true; }
+                // Try ExtJS button component
+                const extBtns = Ext.ComponentQuery.query('button');
+                const extBtn = extBtns.find(b => b.text && b.text.trim() === 'Ver Agregado');
+                if (extBtn && extBtn.el) {
+                    const d = extBtn.el.dom;
+                    d.dispatchEvent(new MouseEvent('mousedown', {bubbles:true,view:window}));
+                    d.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true,view:window}));
+                    d.dispatchEvent(new MouseEvent('click',     {bubbles:true,view:window}));
+                    return 'extjs';
+                }
+                // Fallback: find innermost DOM element with exact text
+                const all = Array.from(document.querySelectorAll('a,button,span,div'))
+                    .filter(e => e.textContent.trim() === 'Ver Agregado')
+                    .sort((a, b) => a.textContent.length - b.textContent.length);
+                if (all.length > 0) { all[0].click(); return 'dom'; }
                 return false;
             })()
         """)
@@ -350,7 +363,7 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
                 timeout=30000
             )
         except Exception:
-            raise ValueError("STEP6: iframe del PDF no apareció")
+            raise ValueError(f"STEP6: iframe del PDF no apareció (click method: {ver_found})")
 
         # ── 6. Obtener URL del PDF desde el visor ─────────────────────────────
         pdf_url = None
