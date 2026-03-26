@@ -226,8 +226,8 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
         page = context.new_page()
 
         # ── 1. Login via ExtJS API ─────────────────────────────────────────────
-        page.goto(RPP_URL, wait_until="networkidle")
-        # Wait for ExtJS to be fully initialized before using its API
+        page.goto(RPP_URL, wait_until="load")
+        # Wait for ExtJS login form to be ready
         page.wait_for_function(
             '() => typeof Ext !== "undefined" && Ext.ComponentQuery && '
             'Ext.ComponentQuery.query("textfield[name=userName]").length > 0',
@@ -247,7 +247,14 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
             }
         """)
         page.wait_for_function('() => !document.querySelector("input[type=password]")', timeout=15000)
-        page.wait_for_timeout(3000)
+        # Wait for main menu tile to appear instead of fixed sleep
+        page.wait_for_function(
+            '() => Array.from(document.querySelectorAll("*")).some('
+            '  e => e.textContent.toLowerCase().includes("consulta") && '
+            '       e.textContent.toLowerCase().includes("tramites") && '
+            '       e.offsetParent !== null)',
+            timeout=10000
+        )
 
         # ── 2. Consulta Avanzada tile ─────────────────────────────────────────
         # Note: site has a typo — "avazada" not "avanzada"
@@ -259,16 +266,24 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
                 .sort((a, b) => a.textContent.length - b.textContent.length)[0];
             if (el) el.click();
         """)
-        page.wait_for_timeout(3000)
+        # Wait for the folio search form to appear
+        page.wait_for_function(
+            '() => Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]").length > 0',
+            timeout=10000
+        )
 
         # ── 3. Escribir folio real via CDP fill (not ExtJS setValue) ──────────
         input_id = page.evaluate('Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]")[0].getInputId()')
         page.fill(f'#{input_id}', str(folio_real))
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(200)
 
         # ── 4. Click Buscar ───────────────────────────────────────────────────
         _ext_dom_click(page, 'Buscar')
-        page.wait_for_timeout(6000)
+        # Wait for "Ver Agregado" to appear instead of fixed sleep
+        page.wait_for_function(
+            '() => Array.from(document.querySelectorAll("*")).some(e => e.textContent.trim() === "Ver Agregado")',
+            timeout=15000
+        )
 
         # ── 5. Click Ver Agregado ─────────────────────────────────────────────
         ver_found = page.evaluate("""
@@ -282,11 +297,15 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
         if not ver_found:
             browser.close()
             raise ValueError("No se encontró el folio real en el registro")
-        page.wait_for_timeout(5000)
+        # Wait for iframe to appear instead of fixed sleep
+        page.wait_for_function(
+            '() => document.querySelector("iframe") !== null',
+            timeout=15000
+        )
 
         # ── 6. Obtener URL del PDF desde el visor ─────────────────────────────
         pdf_url = None
-        for _ in range(8):
+        for _ in range(10):
             pdf_url = page.evaluate("""
                 (() => {
                     try {
@@ -302,7 +321,7 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
             """)
             if pdf_url:
                 break
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1000)
 
         if not pdf_url:
             browser.close()
