@@ -216,6 +216,12 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
 
         # ── 1. Login via ExtJS API ─────────────────────────────────────────────
         page.goto(RPP_URL, wait_until="networkidle")
+        # Wait for ExtJS to be fully initialized before using its API
+        page.wait_for_function(
+            '() => typeof Ext !== "undefined" && Ext.ComponentQuery && '
+            'Ext.ComponentQuery.query("textfield[name=userName]").length > 0',
+            timeout=20000
+        )
         page.evaluate(f'Ext.ComponentQuery.query("textfield[name=userName]")[0].setValue("{RPP_USER}")')
         page.evaluate(f'Ext.ComponentQuery.query("textfield[name=password]")[0].setValue("{RPP_PASS}")')
         page.wait_for_timeout(200)
