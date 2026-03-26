@@ -230,12 +230,16 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
                 '--no-zygote',
-                '--single-process',
                 '--disable-extensions',
                 '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
                 '--disable-sync',
                 '--no-first-run',
                 '--mute-audio',
+                '--disable-images',
+                '--blink-settings=imagesEnabled=false',
             ]
         )
         context = browser.new_context(
@@ -367,16 +371,13 @@ def fetch_pdf_for_folio(folio_real: str) -> bytes:
             raise ValueError("No se pudo obtener el PDF del folio real")
 
         # ── 7. Descargar PDF con cookies de sesión ────────────────────────────
-        pdf_bytes = page.evaluate(f"""
-            async () => {{
-                const r = await fetch("{pdf_url}", {{credentials: "include"}});
-                const buf = await r.arrayBuffer();
-                return Array.from(new Uint8Array(buf));
-            }}
-        """)
+        # Use context.request so the PDF is fetched in Python (not in the
+        # browser JS heap), which avoids doubling memory and is more stable.
+        response = context.request.get(pdf_url)
+        pdf_bytes = response.body()
         browser.close()
 
-    return bytes(pdf_bytes)
+    return pdf_bytes
 
 
 # ── Job store ─────────────────────────────────────────────────────────────────
