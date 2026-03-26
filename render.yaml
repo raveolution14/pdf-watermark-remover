@@ -8,3 +8,13 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+
+  - type: web
+    name: rpp-consulta
+    runtime: python
+    buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps
+    startCommand: gunicorn rpp_app:app
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
