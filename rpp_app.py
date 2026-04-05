@@ -6281,7 +6281,7 @@ def pwa_manifest():
 @app.route('/sw.js')
 def service_worker():
     sw = """
-const CACHE = 'rpp-v8';
+const CACHE = 'rpp-v9';
 const PRECACHE = ['/app.js'];
 
 self.addEventListener('install', e => {
