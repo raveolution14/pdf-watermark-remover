@@ -26,10 +26,11 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-RPP_URL     = "https://srppn.chihuahua.gob.mx/rpp/RppApp/"
-RPP_USER    = "CEMVCHIH"
-RPP_PASS    = "Cemv2026$1"
-ADMIN_EMAIL = "fjhdezg@gmail.com"
+RPP_URL        = "https://srppn.chihuahua.gob.mx/rpp/RppApp/"
+RPP_USER       = "CEMVCHIH"
+RPP_PASS       = "Cemv2026$1"
+ADMIN_EMAIL    = "fjhdezg@gmail.com"
+TWOCAPTCHA_KEY = os.environ.get('TWOCAPTCHA_KEY', '')
 
 app.config.update(
     SECRET_KEY              = os.environ.get('FLASK_SECRET_KEY', 'rpp-dev-secret-CHANGE-ME'),
@@ -990,7 +991,7 @@ def check_folio_alerts():
     notified = 0
     for alert in alerts:
         try:
-            pdf_bytes = fetch_pdf_for_folio(alert['folio_real'])
+            pdf_bytes = fetch_pdf_for_folio(alert['folio_real'])['escritura']
             new_hash  = hashlib.md5(pdf_bytes).hexdigest()
             old_hash  = alert['last_hash']
             with _db() as c:
@@ -1308,7 +1309,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="card">
-  <div class="logo">Consulta RPP</div>
+  <div class="logo"><img src="/static/logo_clean.png" alt="Consulta RPP" style="height:54px;object-fit:contain"></div>
   <p class="sub">Registro Público de la Propiedad · Chihuahua</p>
 
   <!-- Google — método recomendado -->
@@ -3561,6 +3562,12 @@ HTML = """<!DOCTYPE html>
     }
     .search-btn:hover { opacity: .85; }
     .search-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .cancel-btn {
+      padding: .55rem .9rem; background: transparent; border: 1.5px solid #ef4444;
+      color: #ef4444; border-radius: 7px; font-size: .85rem; font-weight: 600;
+      cursor: pointer; transition: background .15s, color .15s; white-space: nowrap; flex-shrink: 0;
+    }
+    .cancel-btn:hover { background: rgba(239,68,68,.15); }
 
     #status, #status2 {
       margin-top: 1rem; display: none; padding: .875rem 1rem;
@@ -3836,6 +3843,7 @@ HTML = """<!DOCTYPE html>
     <button class="tab-btn" onclick="switchTab('nombre')">Por Nombre</button>
     <button class="tab-btn" onclick="switchTab('lote')">Lote</button>
     <button class="tab-btn" onclick="switchTab('agua')" style="color:#38bdf8">💧 Agua JMAS</button>
+    <button class="tab-btn" onclick="switchTab('predial')" style="color:#34d399">🏠 Predial</button>
   </div>
 
   <!-- TAB: Folio Real -->
@@ -3846,8 +3854,12 @@ HTML = """<!DOCTYPE html>
       <div id="folio-suggestions" style="display:none;position:absolute;top:100%;left:0;right:0;background:#13131f;border:1px solid #2a2a3a;border-radius:0 0 10px 10px;max-height:160px;overflow-y:auto;z-index:20"></div>
     </div>
     <div id="folio-history" class="history-chips"></div>
-    <button class="search-btn" id="btn-folio" onclick="buscarFolio()">Buscar PDF</button>
+    <div style="display:flex;gap:.5rem;align-items:stretch">
+      <button class="search-btn" id="btn-folio" onclick="buscarFolio()" style="flex:1">Buscar PDF</button>
+      <button class="cancel-btn" id="cancel-folio" onclick="cancelarBusqueda('folio')" style="display:none">✕ Cancelar</button>
+    </div>
     <div id="status"></div>
+    <div id="folio-extras"></div>
   </div>
 
   <!-- TAB: Lote -->
@@ -3861,7 +3873,10 @@ HTML = """<!DOCTYPE html>
         <input type="file" accept=".csv,.txt" id="csv-upload" onchange="handleCSVUpload(this)" style="display:none">
       </label>
     </div>
-    <button class="search-btn" id="btn-lote" onclick="buscarLote()">Procesar Lote</button>
+    <div style="display:flex;gap:.5rem;align-items:stretch">
+      <button class="search-btn" id="btn-lote" onclick="buscarLote()" style="flex:1">Procesar Lote</button>
+      <button class="cancel-btn" id="cancel-lote" onclick="cancelarBusqueda('lote')" style="display:none">✕ Cancelar</button>
+    </div>
     <div id="lote-status"></div>
     <div id="lote-results"></div>
   </div>
@@ -3885,7 +3900,10 @@ HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div id="nombre-history" class="history-chips"></div>
-    <button class="search-btn" id="btn-nombre" onclick="buscarNombre()">Buscar Propietario</button>
+    <div style="display:flex;gap:.5rem;align-items:stretch">
+      <button class="search-btn" id="btn-nombre" onclick="buscarNombre()" style="flex:1">Buscar Propietario</button>
+      <button class="cancel-btn" id="cancel-nombre" onclick="cancelarBusqueda('nombre')" style="display:none">✕ Cancelar</button>
+    </div>
     <div id="status2"></div>
     <div id="results-container"></div>
   </div>
@@ -3909,9 +3927,27 @@ HTML = """<!DOCTYPE html>
       <label for="agua-ref" style="font-size:.78rem;color:#8b9cf4">No. de cliente / Referencia</label>
       <input type="text" id="agua-ref" placeholder="Ej. o208130" autocomplete="off">
     </div>
-    <button class="search-btn" id="btn-agua" onclick="buscarAgua()" style="background:linear-gradient(135deg,#0ea5e9,#0284c7)">Consultar Adeudo</button>
+    <div style="display:flex;gap:.5rem;align-items:stretch">
+      <button class="search-btn" id="btn-agua" onclick="buscarAgua()" style="flex:1;background:linear-gradient(135deg,#0ea5e9,#0284c7)">Consultar Adeudo</button>
+      <button class="cancel-btn" id="cancel-agua" onclick="cancelarBusqueda('agua')" style="display:none">✕ Cancelar</button>
+    </div>
     <div id="agua-status" style="margin-top:.75rem"></div>
     <div id="agua-result"></div>
+  </div>
+
+  <!-- TAB: Predial -->
+  <div class="tab-panel" id="tab-predial">
+    <label>Consultar adeudo de predial municipal</label>
+    <div style="margin-top:.5rem">
+      <label for="predial-clave" style="font-size:.78rem;color:#34d399">Clave Catastral</label>
+      <input type="text" id="predial-clave" placeholder="Ej. 251-022-008" autocomplete="off">
+    </div>
+    <div style="display:flex;gap:.5rem;align-items:stretch">
+      <button class="search-btn" id="btn-predial" onclick="buscarPredial()" style="flex:1;background:linear-gradient(135deg,#059669,#047857)">Consultar Predial</button>
+      <button class="cancel-btn" id="cancel-predial" onclick="cancelarBusqueda('predial')" style="display:none">✕ Cancelar</button>
+    </div>
+    <div id="predial-status" style="margin-top:.75rem"></div>
+    <div id="predial-result"></div>
   </div>
 
   <p class="footer">Diseñado por Javisness · <a href="/estado" style="color:inherit;text-decoration:none" id="status-footer-link">● Estado del servicio</a></p>
@@ -3948,6 +3984,46 @@ HTML = """<!DOCTYPE html>
       <button class="btn-primary" onclick="buyExtraAndDownload()">Descarga extra — $130 MXN</button>
       <button class="btn-primary" style="background:#6366f1" onclick="window.location='/pricing'">Mejorar plan</button>
       <button class="btn-cancel" onclick="closeQuotaModal()">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Antecedentes Document Preview modal -->
+<div class="preview-overlay" id="anteced-preview-overlay">
+  <div class="preview-header">
+    <span class="preview-title" id="anteced-preview-title">Vista previa — Documento</span>
+    <button class="preview-close" onclick="closeAntecedPreview()">✕ Cerrar</button>
+  </div>
+  <div style="position:relative;width:min(92vw,900px);height:76vh;border-radius:8px;overflow:hidden;flex-shrink:0">
+    <!-- Loading overlay shown while Playwright fetches the PDF -->
+    <div id="anteced-loading" style="display:flex;position:absolute;inset:0;background:#050a1e;border-radius:8px;flex-direction:column;align-items:center;justify-content:center;gap:.9rem;z-index:5">
+      <div style="width:38px;height:38px;border:3px solid #1e3a5f;border-top-color:#60a5fa;border-radius:50%;animation:spin .9s linear infinite"></div>
+      <div style="color:#93c5fd;font-size:.9rem;font-weight:600">Obteniendo escritura del RPP…</div>
+      <div id="anteced-loading-msg" style="color:#64748b;font-size:.78rem">Iniciando conexión segura</div>
+    </div>
+    <!-- Error panel -->
+    <div id="anteced-preview-error" style="display:none;position:absolute;inset:0;background:#050a1e;border-radius:8px;flex-direction:column;align-items:center;justify-content:center;gap:.6rem;padding:1.5rem;text-align:center">
+      <div style="font-size:2rem">⚠️</div>
+      <div id="anteced-preview-errmsg" style="color:#f87171;font-size:.875rem"></div>
+    </div>
+    <iframe class="preview-iframe" id="anteced-preview-iframe" src="" style="width:100%;height:100%;border:none;border-radius:8px;display:block"></iframe>
+  </div>
+  <div class="preview-footer" style="gap:.625rem;flex-wrap:wrap;align-items:center;width:min(92vw,900px)">
+    <span id="anteced-quota-badge" style="font-size:.78rem;color:#94a3b8;flex:1"></span>
+    <button class="btn-cancel" onclick="closeAntecedPreview()">Cerrar</button>
+    <button class="btn-primary" id="anteced-dl-btn" disabled>⬇ Descargar</button>
+  </div>
+</div>
+
+<!-- Antecedentes Quota / Upgrade modal -->
+<div class="modal-overlay" id="anteced-quota-modal">
+  <div class="modal">
+    <h3>Sin créditos de descarga</h3>
+    <p id="anteced-quota-msg">No tienes descargas disponibles este mes.</p>
+    <div class="modal-btns">
+      <button class="btn-primary" onclick="pagarDescargaAnteced()">&#128176; Comprar — $130 MXN</button>
+      <button class="btn-primary" style="background:#6366f1" onclick="window.location='/pricing'">Mejorar plan ↑</button>
+      <button class="btn-cancel" onclick="closeAntecedQuotaModal()">Cancelar</button>
     </div>
   </div>
 </div>
@@ -4120,7 +4196,7 @@ document.addEventListener('DOMContentLoaded', loadUserBar);
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function switchTab(tab) {
-  const tabs = ['folio', 'nombre', 'lote', 'agua'];
+  const tabs = ['folio', 'nombre', 'lote', 'agua', 'predial'];
   const isFree = _userInfo && _userInfo.sub_status !== 'active' && _userInfo.role !== 'admin' && !_userInfo.in_trial && !_userInfo.is_team_member;
   const locked = (tab === 'nombre' && isFree) || (tab === 'lote' && !_canLote());
   if (locked) {
@@ -4130,7 +4206,8 @@ function switchTab(tab) {
       b.classList.toggle('active', tabs[i] === tab);
     });
     tabs.forEach(t => {
-      document.getElementById('tab-' + t).classList.toggle('active', t === tab);
+      const el = document.getElementById('tab-' + t);
+      if (el) el.classList.toggle('active', t === tab);
     });
     // Remove existing overlay so message stays updated
     const existing = panel.querySelector('.lock-overlay');
@@ -4156,7 +4233,8 @@ function switchTab(tab) {
     b.classList.toggle('active', tabs[i] === tab);
   });
   tabs.forEach(t => {
-    document.getElementById('tab-' + t).classList.toggle('active', t === tab);
+    const el = document.getElementById('tab-' + t);
+    if (el) el.classList.toggle('active', t === tab);
   });
 }
 
@@ -4173,6 +4251,38 @@ async function handleApiError(res, fallbackMsg) {
     return true;
   }
   return false;
+}
+
+// ── Search cancel support ─────────────────────────────────────────────────────
+const _searchState = {
+  folio:   { ctrl: null, poll: null },
+  nombre:  { ctrl: null, poll: null },
+  lote:    { ctrl: null, poll: null },
+  agua:    { ctrl: null, poll: null },
+  predial: { ctrl: null, poll: null },
+  sat:     { ctrl: null, poll: null },
+};
+const _cancelBtnMap  = { folio:'cancel-folio', nombre:'cancel-nombre', lote:'cancel-lote', agua:'cancel-agua', predial:'cancel-predial', sat:'cancel-sat' };
+const _searchBtnMap  = { folio:'btn-folio',    nombre:'btn-nombre',    lote:'btn-lote',    agua:'btn-agua',    predial:'btn-predial',    sat:'btn-sat' };
+const _statusElMap   = { folio:'status',       nombre:'status2',       lote:'lote-status', agua:'agua-status', predial:'predial-status', sat:'sat-status' };
+
+function _showCancel(id) { const b = document.getElementById(_cancelBtnMap[id]); if(b) b.style.display = ''; }
+function _hideCancel(id) { const b = document.getElementById(_cancelBtnMap[id]); if(b) b.style.display = 'none'; }
+
+function cancelarBusqueda(id) {
+  const s = _searchState[id]; if (!s) return;
+  if (s.ctrl)  { try { s.ctrl.abort(); } catch(e){} s.ctrl = null; }
+  if (s.poll)  { clearInterval(s.poll); s.poll = null; }
+  _hideCancel(id);
+  const btn = document.getElementById(_searchBtnMap[id]);
+  const st  = document.getElementById(_statusElMap[id]);
+  if (btn) btn.disabled = false;
+  if (st)  { st.style.display = 'none'; st.innerHTML = ''; }
+  // Clear elapsed timer for folio
+  if (id === 'folio') {
+    const stEl = document.getElementById('status');
+    if (stEl && stEl._elapsedInterval) { clearInterval(stEl._elapsedInterval); stEl._elapsedInterval = null; }
+  }
 }
 
 // ── Folio search ──────────────────────────────────────────────────────────────
@@ -4200,40 +4310,45 @@ async function buscarFolio() {
   }, 200);
   // Store interval to clear on done
   status._elapsedInterval = _elapsedInterval;
+  const _ctrl = new AbortController();
+  _searchState.folio.ctrl = _ctrl;
+  _showCancel('folio');
   try {
     const res = await fetch('/buscar', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({folio})
+      body: JSON.stringify({folio}),
+      signal: _ctrl.signal
     });
     if (!res.ok) {
-      if (await handleApiError(res)) { btn.disabled = false; return; }
+      if (await handleApiError(res)) { btn.disabled = false; _hideCancel('folio'); return; }
       if (status._elapsedInterval) clearInterval(status._elapsedInterval);
       const err = await res.json().catch(() => ({error: 'Error desconocido'}));
       status.className = 'error';
       status.innerHTML = '&#10060; ' + (err.error || 'Error desconocido');
-      btn.disabled = false;
-      return;
+      btn.disabled = false; _hideCancel('folio'); return;
     }
+    _searchState.folio.ctrl = null;
     const {job_id} = await res.json();
     pollFolioJob(job_id, folio, btn, status, autoDownload);
   } catch(e) {
     if (status._elapsedInterval) clearInterval(status._elapsedInterval);
+    if (e.name === 'AbortError') return; // cancelled by user — UI already reset
     status.className = 'error';
     status.innerHTML = '&#10060; Error de red: ' + e.message;
-    btn.disabled = false;
+    btn.disabled = false; _hideCancel('folio');
   }
 }
 
 function pollFolioJob(job_id, folio, btn, statusEl, autoDownload) {
-  const poll = setInterval(async () => {
+  const poll = _searchState.folio.poll = setInterval(async () => {
     // Re-evaluate isFree at result time so loadUserBar updates are captured
     const isFree = _userInfo && _userInfo.sub_status !== 'active' && _userInfo.role !== 'admin' && !(_userInfo && _userInfo.in_trial) && !(_userInfo && _userInfo.is_team_member);
     try {
       const sr = await fetch('/status/' + job_id);
       const s  = await sr.json();
       if (s.status === 'done') {
-        clearInterval(poll);
+        clearInterval(poll); _searchState.folio.poll = null; _hideCancel('folio');
         if (statusEl._elapsedInterval) clearInterval(statusEl._elapsedInterval);
         statusEl.className = 'success';
         const previewBtn = _canPreview()
@@ -4248,27 +4363,40 @@ function pollFolioJob(job_id, folio, btn, statusEl, autoDownload) {
             + ' &nbsp;<button class="dl-btn" style="border:none;cursor:pointer" onclick="pagarYDescargar(\'' + job_id + '\',\'' + folio + '\')">&#128176; Descargar — $130 MXN</button>'
             + alertBtn;
         } else {
+            const inscBtn = s.has_inscripcion
+            ? ' &nbsp;<a class="dl-btn" style="background:#1d4ed8" href="/download/' + job_id + '/inscripcion" download="inscripcion_' + folio + '.pdf" id="dl-insc-' + job_id + '" onclick="showToastSuccess(\'✓ Descargando inscripción...\')">&#11015; Inscripción</a>'
+            : '';
           statusEl.innerHTML = '&#10003; Documento listo &nbsp;'
             + previewBtn
             + ' &nbsp;<a id="dl-auto-' + job_id + '" class="dl-btn" href="/download/' + job_id + '" download="folio_' + folio + '_sin_marca.pdf" onclick="loadUserBar();showToastSuccess(\'✓ Descargando escritura...\')">&#11015; Descargar</a>'
+            + inscBtn
             + alertBtn;
           if (autoDownload) {
             setTimeout(() => {
               const a = document.getElementById('dl-auto-' + job_id);
               if (a) { loadUserBar(); showToastSuccess('✓ Descargando escritura...'); a.click(); }
             }, 200);
+            if (s.has_inscripcion) {
+              setTimeout(() => {
+                const ai = document.getElementById('dl-insc-' + job_id);
+                if (ai) { showToastSuccess('✓ Descargando inscripción...'); ai.click(); }
+              }, 1200);
+            }
           }
         }
         btn.disabled = false;
+        // Inject gravámenes / antecedentes bar below status
+        const extrasEl = document.getElementById('folio-extras');
+        if (extrasEl) _injectExtrasBar(extrasEl, folio);
       } else if (s.status === 'error') {
-        clearInterval(poll);
+        clearInterval(poll); _searchState.folio.poll = null; _hideCancel('folio');
         if (statusEl._elapsedInterval) clearInterval(statusEl._elapsedInterval);
         statusEl.className = 'error';
         statusEl.innerHTML = '&#10060; ' + s.error;
         btn.disabled = false;
       }
     } catch(e) {
-      clearInterval(poll);
+      clearInterval(poll); _searchState.folio.poll = null; _hideCancel('folio');
       if (statusEl._elapsedInterval) clearInterval(statusEl._elapsedInterval);
       statusEl.className = 'error';
       statusEl.innerHTML = '&#10060; Error de red: ' + e.message;
@@ -4298,27 +4426,31 @@ async function buscarNombre() {
   status2.className = 'loading';
   status2.style.display = 'block';
   status2.innerHTML = '<span class="spinner"></span>Buscando propietario <b>' + [nombre,paterno,materno].filter(Boolean).join(' ') + '</b>...<div class="bar"><div class="fill"></div></div>';
+  const _ctrl = new AbortController();
+  _searchState.nombre.ctrl = _ctrl;
+  _showCancel('nombre');
   try {
     const res = await fetch('/buscar-nombre', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({nombre, paterno, materno})
+      body: JSON.stringify({nombre, paterno, materno}),
+      signal: _ctrl.signal
     });
     if (!res.ok) {
-      if (await handleApiError(res)) { btn.disabled = false; return; }
+      if (await handleApiError(res)) { btn.disabled = false; _hideCancel('nombre'); return; }
       const err = await res.json().catch(() => ({error: 'Error desconocido'}));
       status2.className = 'error';
       status2.innerHTML = '&#10060; ' + (err.error || 'Error');
-      btn.disabled = false;
-      return;
+      btn.disabled = false; _hideCancel('nombre'); return;
     }
+    _searchState.nombre.ctrl = null;
     const {job_id} = await res.json();
-    const poll = setInterval(async () => {
+    _searchState.nombre.poll = setInterval(async () => {
       try {
         const sr = await fetch('/status/' + job_id);
         const s  = await sr.json();
         if (s.status === 'done') {
-          clearInterval(poll);
+          clearInterval(_searchState.nombre.poll); _searchState.nombre.poll = null; _hideCancel('nombre');
           btn.disabled = false;
           const data = s.results || [];
           if (!data.length) {
@@ -4331,22 +4463,23 @@ async function buscarNombre() {
           status2.innerHTML = '&#10003; Se encontró ' + data.length + ' propietario(s) con ' + totalProps + ' propiedad(es).';
           renderResultados(data);
         } else if (s.status === 'error') {
-          clearInterval(poll);
+          clearInterval(_searchState.nombre.poll); _searchState.nombre.poll = null; _hideCancel('nombre');
           status2.className = 'error';
           status2.innerHTML = '&#10060; ' + s.error;
           btn.disabled = false;
         }
       } catch(e) {
-        clearInterval(poll);
+        clearInterval(_searchState.nombre.poll); _searchState.nombre.poll = null; _hideCancel('nombre');
         status2.className = 'error';
         status2.innerHTML = '&#10060; Error de red: ' + e.message;
         btn.disabled = false;
       }
     }, 3000);
   } catch(e) {
+    if (e.name === 'AbortError') return;
     status2.className = 'error';
     status2.innerHTML = '&#10060; Error de red: ' + e.message;
-    btn.disabled = false;
+    btn.disabled = false; _hideCancel('nombre');
   }
 }
 
@@ -4377,12 +4510,25 @@ function renderResultados(data) {
           <td>${prop.domicilio || '—'}</td><td>${prop.colonia || '—'}</td>
           <td>${prop.municipio || '—'}</td><td>${sup}</td>
           <td>${prop.clave_cat || '—'}</td>
-          <td>${prop.tiene_agregado
+          <td style="white-space:nowrap">${prop.tiene_agregado
             ? `<button class="dl-row-btn" id="dlbtn-${prop.folio_real}"
                  data-nombre="${nombreCompleto.replace(/"/g,'&quot;')}"
                  onclick="descargarPropiedad(${prop.folio_real}, this, this.dataset.nombre)">&#11015; PDF</button>`
             : '<span class="no-pdf">Sin PDF</span>'
-          }</td></tr>`;
+          }
+          &nbsp;<button onclick="toggleExtrasSection('grav-n${prop.folio_real}','${prop.folio_real}','gravamenes')"
+            id="btn-grav-n${prop.folio_real}"
+            style="background:#1e1b4b;border:1px solid #4c1d95;color:#a78bfa;border-radius:6px;padding:.2rem .5rem;font-size:.72rem;cursor:pointer;white-space:nowrap">⚖️</button>
+          &nbsp;<button onclick="toggleExtrasSection('ant-n${prop.folio_real}','${prop.folio_real}','antecedentes')"
+            id="btn-ant-n${prop.folio_real}"
+            style="background:#1c1407;border:1px solid #92400e;color:#fbbf24;border-radius:6px;padding:.2rem .5rem;font-size:.72rem;cursor:pointer;white-space:nowrap">📋</button>
+          </td></tr>
+          <tr id="extras-row-${prop.folio_real}" style="display:none">
+            <td colspan="7" style="padding:.5rem 1rem .5rem 2rem">
+              <div id="grav-n${prop.folio_real}" style="display:none;margin-bottom:.4rem;padding:.6rem;background:#0a0f1e;border-radius:8px;border:1px solid #1e1b4b"></div>
+              <div id="ant-n${prop.folio_real}" style="display:none;padding:.6rem;background:#0a0f1e;border-radius:8px;border:1px solid #1c1a0a"></div>
+            </td>
+          </tr>`;
       }
       html += '</tbody></table></div>';
     }
@@ -4437,9 +4583,24 @@ async function descargarPropiedad(folioReal, btnEl, nombreProp) {
           dl.href = '/download/' + job_id;
           dl.download = 'folio_' + folioReal + '_sin_marca.pdf';
           dl.textContent = '⬇';
-          dl.title = 'Descargar';
+          dl.title = 'Descargar escritura';
           dl.onclick = () => { loadUserBar(); showToastSuccess('✓ Descargando escritura...'); };
           cell.appendChild(dl);
+          if (s.has_inscripcion) {
+            const di = document.createElement('a');
+            di.className = 'dl-row-btn';
+            di.style.cssText = 'margin-left:.3rem;text-decoration:none;display:inline-block;padding:.3rem .7rem;font-size:.75rem;background:#1d4ed8';
+            di.href = '/download/' + job_id + '/inscripcion';
+            di.download = 'inscripcion_' + folioReal + '.pdf';
+            di.textContent = '⬇ Insc.';
+            di.title = 'Descargar inscripción';
+            di.onclick = () => showToastSuccess('✓ Descargando inscripción...');
+            cell.appendChild(di);
+            setTimeout(() => { showToastSuccess('✓ Descargando escritura...'); dl.click(); }, 200);
+            setTimeout(() => { showToastSuccess('✓ Descargando inscripción...'); di.click(); }, 1200);
+          } else {
+            setTimeout(() => { loadUserBar(); showToastSuccess('✓ Descargando escritura...'); dl.click(); }, 200);
+          }
           if (_canPreview()) {
             const prev = document.createElement('button');
             prev.className = 'btn-preview';
@@ -4917,13 +5078,17 @@ async function buscarLote() {
   statusEl.className = 'loading'; statusEl.style.display = 'block';
   statusEl.innerHTML = '<span class="spinner"></span>Enviando ' + folios.length + ' folio(s)...<div class="bar"><div class="fill"></div></div>';
   resultsEl.innerHTML = '';
-
+  const _ctrl = new AbortController();
+  _searchState.lote.ctrl = _ctrl;
+  _showCancel('lote');
   try {
     const res = await fetch('/buscar-lote', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({folios})
+      body: JSON.stringify({folios}),
+      signal: _ctrl.signal
     });
+    _searchState.lote.ctrl = null; _hideCancel('lote');
     if (!res.ok) {
       if (await handleApiError(res)) { btn.disabled = false; return; }
       const err = await res.json().catch(() => ({}));
@@ -4937,9 +5102,10 @@ async function buscarLote() {
     renderLoteTable(jobs);
     jobs.forEach(j => pollLoteJob(j.job_id, j.folio));
   } catch(e) {
+    if (e.name === 'AbortError') return;
     statusEl.className = 'error';
     statusEl.innerHTML = '&#10060; Error de red: ' + e.message;
-    btn.disabled = false;
+    btn.disabled = false; _hideCancel('lote');
   }
 }
 
@@ -4969,7 +5135,8 @@ function pollLoteJob(job_id, folio) {
         if (st)  { st.className = 'lote-st ok'; st.textContent = '✓ Listo'; _sendLocalNotification('Folio ' + folio, 'PDF listo para descargar'); }
         if (act) act.innerHTML =
           '<button class="btn-preview" style="padding:.25rem .6rem;font-size:.75rem" onclick="openPreview(\'' + job_id + '\',\'' + folio + '\')">👁 Preview</button>'
-          + ' <a class="dl-row-btn" style="text-decoration:none;display:inline-block;padding:.3rem .7rem;font-size:.75rem" href="/download/' + job_id + '" download="folio_' + folio + '_sin_marca.pdf" onclick="loadUserBar();showToastSuccess(\'✓ Descargando escritura...\')">⬇ Descargar</a>';
+          + ' <a class="dl-row-btn" style="text-decoration:none;display:inline-block;padding:.3rem .7rem;font-size:.75rem" href="/download/' + job_id + '" download="folio_' + folio + '_sin_marca.pdf" onclick="loadUserBar();showToastSuccess(\'✓ Descargando escritura...\')">⬇ Descargar</a>'
+          + (s.has_inscripcion ? ' <a class="dl-row-btn" style="text-decoration:none;display:inline-block;padding:.3rem .7rem;font-size:.75rem;background:#1d4ed8" href="/download/' + job_id + '/inscripcion" download="inscripcion_' + folio + '.pdf" onclick="showToastSuccess(\'✓ Descargando inscripción...\')">⬇ Inscripción</a>' : '');
       } else if (s.status === 'error') {
         clearInterval(poll);
         const st = document.getElementById('lote-st-' + job_id);
@@ -5002,13 +5169,17 @@ async function buscarAgua() {
   statusEl.className = 'loading'; statusEl.style.display = 'block';
   statusEl.innerHTML = '<span class="spinner"></span>Consultando JMAS...';
   resultEl.innerHTML = '';
-
+  const _ctrl = new AbortController();
+  _searchState.agua.ctrl = _ctrl;
+  _showCancel('agua');
   try {
     const res = await fetch('/agua/consultar', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({calle, numero: num, referencia: ref})
+      body: JSON.stringify({calle, numero: num, referencia: ref}),
+      signal: _ctrl.signal
     });
+    _searchState.agua.ctrl = null; _hideCancel('agua');
     const d = await res.json();
     if (!res.ok) {
       statusEl.className = 'error';
@@ -5035,9 +5206,541 @@ async function buscarAgua() {
         </table>
       </div>`;
   } catch(e) {
+    if (e.name === 'AbortError') return;
     statusEl.className = 'error';
     statusEl.innerHTML = '&#10060; Error de red: ' + e.message;
+    btn.disabled = false; _hideCancel('agua');
+  }
+}
+
+// ── Gravámenes / Antecedentes inline helpers ──────────────────────────────────
+function _renderGravamenes(d) {
+  if (!d.gravamenes || d.gravamenes.length === 0)
+    return '<div style="color:#4ade80;padding:.5rem 0">&#10003; Sin gravámenes registrados</div>';
+  const rows = d.gravamenes.map(g => {
+    const fecha = g.fecha ? g.fecha.slice(0,10).split('-').reverse().join('/') : '—';
+    const vigente = g.vigente === 'S';
+    const badge = vigente
+      ? '<span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:99px;font-size:.72rem;font-weight:700">VIGENTE</span>'
+      : '<span style="background:#374151;color:#9ca3af;padding:2px 8px;border-radius:99px;font-size:.72rem">CANCELADO</span>';
+    return `<div style="border:1px solid ${vigente?'#7c3aed':'#374151'};border-radius:8px;padding:.7rem;margin-bottom:.5rem;background:#0f172a">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.4rem">
+        <span style="color:#a78bfa;font-weight:700;font-size:.88rem">${g.acto || '—'}</span>${badge}
+      </div>
+      <div style="font-size:.78rem;color:#94a3b8;display:grid;grid-template-columns:1fr 1fr;gap:.2rem .5rem">
+        <span>Fecha: <b style="color:#f1f5f9">${fecha}</b></span>
+        <span>Insc: <b style="color:#f1f5f9">${g.inscripcion||'—'}</b></span>
+        <span>Libro: <b style="color:#f1f5f9">${g.libro||'—'}</b></span>
+        <span>Sección: <b style="color:#f1f5f9">${g.seccion||'—'}</b></span>
+      </div>
+      ${g.datosActo?`<div style="margin-top:.4rem;font-size:.76rem;color:#cbd5e1;line-height:1.35">${g.datosActo.slice(0,280)}${g.datosActo.length>280?'…':''}</div>`:''}
+    </div>`;
+  }).join('');
+  return `<div style="color:#a78bfa;font-size:.8rem;margin-bottom:.4rem;font-weight:600">⚖️ ${d.gravamenes.length} gravamen(es)</div>${rows}`;
+}
+
+function _antecedDocButton(partida, folio, acto) {
+  const PAID_PLANS = ['basico','pro','empresarial','corporativo','corporativo_pro'];
+  const u = _userInfo;
+  const hasPlan = u && (
+    u.role === 'admin' ||
+    u.in_trial ||
+    (u.sub_status === 'active' && PAID_PLANS.includes(u.plan)) ||
+    u.is_team_member
+  );
+  const encodedActo = encodeURIComponent((acto||'').slice(0,60));
+  if (hasPlan) {
+    return `<button onclick="verPreviaAnteced(${partida},'${folio}','${encodedActo}')"
+      style="margin-top:.3rem;padding:.15rem .5rem;font-size:.7rem;background:#1e3a5f;color:#93c5fd;border:1px solid #2563eb;border-radius:3px;cursor:pointer;line-height:1.4">
+      🔍 Ver documento</button>`;
+  }
+  return `<span onclick="window.location='/pricing'"
+    title="Requiere plan Básico o superior"
+    style="margin-top:.3rem;display:inline-block;padding:.15rem .5rem;font-size:.7rem;background:#1c1407;color:#fbbf24;border:1px solid #92400e;border-radius:3px;cursor:pointer;line-height:1.4">
+    🔒 Básico+</span>`;
+}
+
+function _renderAntecedentes(d, folio) {
+  if (!d.antecedentes || d.antecedentes.length === 0)
+    return '<div style="color:#94a3b8;padding:.5rem 0">Sin antecedentes encontrados</div>';
+  const sc = {'VIGENTE':'#4ade80','CANCELADO':'#6b7280','PASO A FAVOR':'#60a5fa'};
+  const rows = d.antecedentes.map(a => {
+    const fecha = a.fecha ? a.fecha.slice(0,10).split('-').reverse().join('/') : '—';
+    const est = (a.estatus||'').toUpperCase();
+    const color = sc[est]||'#94a3b8';
+    const acto = a.acto.replace(/<[^>]+>/g,'');
+    const dlBtn = (a.tieneAgregado && a.partida > 0) ? _antecedDocButton(a.partida, folio||'', acto) : '';
+    return `<div style="display:flex;gap:.6rem;margin-bottom:.5rem;padding-bottom:.5rem;border-bottom:1px solid #1e293b">
+      <div style="flex-shrink:0;text-align:right;min-width:62px">
+        <div style="color:#64748b;font-size:.72rem">${fecha}</div>
+        <div style="color:${color};font-size:.68rem;font-weight:600;margin-top:1px">${est||'—'}</div>
+      </div>
+      <div style="flex:1">
+        <div style="color:#f1f5f9;font-size:.84rem;font-weight:600">${acto||'—'}</div>
+        ${a.inscripcion?`<div style="color:#64748b;font-size:.72rem">Insc.${a.inscripcion}·Lib.${a.libro||'—'}·${a.seccion||'—'}</div>`:''}
+        ${a.datosActo?`<div style="color:#94a3b8;font-size:.75rem;margin-top:.15rem;line-height:1.3">${a.datosActo.slice(0,220)}${a.datosActo.length>220?'…':''}</div>`:''}
+        ${dlBtn}
+      </div>
+    </div>`;
+  }).join('');
+  return `<div style="color:#fbbf24;font-size:.8rem;margin-bottom:.4rem;font-weight:600">📋 ${d.antecedentes.length} movimiento(s)</div>${rows}`;
+}
+
+// ── Antecedentes Document Preview & Download ─────────────────────────────────
+let _pendingAntecedPartida = null;
+let _pendingAntecedFolio   = null;
+
+function closeAntecedPreview() {
+  document.getElementById('anteced-preview-overlay').classList.remove('open');
+  const iframe = document.getElementById('anteced-preview-iframe');
+  if (iframe.src && iframe.src.startsWith('blob:')) URL.revokeObjectURL(iframe.src);
+  iframe.src = '';
+  document.getElementById('anteced-loading').style.display  = 'none';
+  document.getElementById('anteced-preview-error').style.display = 'none';
+  const dlBtn = document.getElementById('anteced-dl-btn');
+  if (dlBtn) { dlBtn.disabled = true; dlBtn.onclick = null; }
+  _pendingAntecedPartida = null;
+  _pendingAntecedFolio   = null;
+}
+
+function closeAntecedQuotaModal() {
+  document.getElementById('anteced-quota-modal').style.display = 'none';
+}
+
+function showAntecedQuotaModal() {
+  const u = _userInfo;
+  const PLAN_NAMES = {basico:'Básico',pro:'Pro',empresarial:'Empresarial',corporativo:'Corporativo',corporativo_pro:'Corp. Pro'};
+  const planLabel = (u && u.plan && PLAN_NAMES[u.plan]) ? PLAN_NAMES[u.plan] : (u && u.plan ? u.plan : 'tu plan');
+  document.getElementById('anteced-quota-msg').textContent =
+    'Agotaste las descargas de ' + planLabel + ' este mes. ' +
+    'Compra una descarga extra por $130 MXN o mejora tu plan.';
+  document.getElementById('anteced-quota-modal').style.display = 'flex';
+}
+
+async function pagarDescargaAnteced() {
+  closeAntecedQuotaModal();
+  try {
+    const res = await fetch('/create-checkout/extra', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({return_folio: _pendingAntecedFolio || ''})
+    });
+    const d = await res.json();
+    if (d.url) window.location = d.url;
+    else alert('Error: ' + (d.error || 'No se pudo crear la sesión de pago'));
+  } catch(e) { alert('Error de red'); }
+}
+
+async function verPreviaAnteced(partida, folio, encodedActo) {
+  const u = _userInfo;
+  if (!u) { window.location = '/login'; return; }
+
+  const PAID_PLANS = ['basico','pro','empresarial','corporativo','corporativo_pro'];
+  const hasPlan = u.role === 'admin' || u.in_trial ||
+    (u.sub_status === 'active' && PAID_PLANS.includes(u.plan)) ||
+    u.is_team_member;
+
+  if (!hasPlan) {
+    if (confirm('Esta función requiere un plan Básico o superior.\n¿Ver planes de suscripción?')) {
+      window.location = '/pricing';
+    }
+    return;
+  }
+
+  _pendingAntecedPartida = partida;
+  _pendingAntecedFolio   = folio;
+
+  const actoLabel = encodedActo ? decodeURIComponent(encodedActo) : 'Documento';
+  document.getElementById('anteced-preview-title').textContent = '🔍 ' + actoLabel;
+
+  // Configurar botón de descarga y badge
+  const badge = document.getElementById('anteced-quota-badge');
+  const dlBtn = document.getElementById('anteced-dl-btn');
+  dlBtn.disabled = true;  // habilitado cuando la vista previa cargue
+
+  if (u.role === 'admin') {
+    badge.textContent = '';
+    dlBtn.textContent = '⬇ Descargar';
+    dlBtn.style.background = '';
+    dlBtn.style.borderColor = '';
+  } else {
+    const left = (u.downloads_left || 0);
+    if (left > 0) {
+      badge.textContent = left + ' descarga' + (left === 1 ? '' : 's') + ' disponible' + (left === 1 ? '' : 's');
+      badge.style.color = '#4ade80';
+      dlBtn.textContent = '⬇ Descargar (consume 1 crédito)';
+      dlBtn.style.background = '';
+      dlBtn.style.borderColor = '';
+    } else {
+      badge.textContent = 'Sin créditos este mes';
+      badge.style.color = '#f87171';
+      dlBtn.textContent = '💳 Comprar — $130 MXN';
+      dlBtn.style.background = '#7c2d12';
+      dlBtn.style.borderColor = '#dc2626';
+    }
+  }
+
+  // Mostrar modal con estado de carga
+  const loading  = document.getElementById('anteced-loading');
+  const errPanel = document.getElementById('anteced-preview-error');
+  const iframe   = document.getElementById('anteced-preview-iframe');
+  loading.style.display  = 'flex';
+  errPanel.style.display = 'none';
+  iframe.src = '';
+  document.getElementById('anteced-preview-overlay').classList.add('open');
+
+  // Contador de tiempo para feedback al usuario
+  let elapsed = 0;
+  const msgs = [
+    'Iniciando conexión segura…',
+    'Autenticando en el RPP…',
+    'Buscando escritura digitalizada…',
+    'Descargando documento del registro…',
+    'Preparando vista previa…',
+  ];
+  const tick = setInterval(() => {
+    elapsed++;
+    const el = document.getElementById('anteced-loading-msg');
+    if (el) el.textContent = (msgs[Math.min(elapsed - 1, msgs.length - 1)] || 'Un momento más…') +
+      ' (' + elapsed + 's)';
+  }, 1000);
+
+  try {
+    const res = await fetch(
+      '/antecedentes/preview?folio=' + encodeURIComponent(folio) + '&partida=' + partida
+    );
+    clearInterval(tick);
+
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      loading.style.display = 'none';
+      errPanel.style.display = 'flex';
+      document.getElementById('anteced-preview-errmsg').textContent =
+        d.error || 'No se pudo obtener la vista previa. El documento puede no estar digitalizado.';
+      return;
+    }
+
+    const blob    = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    iframe.src = blobUrl;
+    iframe.onload = () => {
+      loading.style.display = 'none';
+      // Habilitar botón de descarga ahora que la previa cargó
+      dlBtn.disabled = false;
+      if (u.role === 'admin' || (u.downloads_left || 0) > 0) {
+        dlBtn.onclick = () => { URL.revokeObjectURL(blobUrl); confirmarDescargaAnteced(partida, folio); };
+      } else {
+        dlBtn.onclick = () => { URL.revokeObjectURL(blobUrl); closeAntecedPreview(); showAntecedQuotaModal(); };
+      }
+    };
+
+  } catch(e) {
+    clearInterval(tick);
+    loading.style.display = 'none';
+    errPanel.style.display = 'flex';
+    document.getElementById('anteced-preview-errmsg').textContent =
+      'Error de red al cargar la vista previa.';
+  }
+}
+
+async function confirmarDescargaAnteced(partida, folio) {
+  const btn = document.getElementById('anteced-dl-btn');
+  const orig = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Descargando...'; }
+  try {
+    const res = await fetch('/antecedentes/documento', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({folio: String(folio), partida: Number(partida)})
+    });
+    if (res.status === 402) {
+      const d = await res.json().catch(() => ({}));
+      closeAntecedPreview();
+      if (d.no_plan) {
+        if (confirm('Esta función requiere un plan activo.\n¿Ver planes?')) window.location = '/pricing';
+      } else {
+        showAntecedQuotaModal();
+      }
+      return;
+    }
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      alert('No disponible: ' + (d.error || res.status));
+      return;
+    }
+    const ct = res.headers.get('content-type') || '';
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    // Trigger first file download
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = ct.includes('zip') ? 'documentos_partida_' + partida + '.zip' : 'escritura_' + partida + '.pdf';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    // Update local quota display
+    if (_userInfo && typeof _userInfo.downloads_left === 'number' && _userInfo.downloads_left > 0) {
+      _userInfo.downloads_left--;
+    }
+    closeAntecedPreview();
+  } catch(e) {
+    alert('Error de red al descargar documento');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
+  }
+}
+
+async function toggleExtrasSection(containerId, folio, tipo) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (el.dataset.loaded === '1') {
+    el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    const btn = document.getElementById('btn-' + containerId);
+    if (btn) btn.textContent = el.style.display === 'none'
+      ? (tipo === 'gravamenes' ? '⚖️ Gravámenes ▼' : '📋 Antecedentes ▼')
+      : (tipo === 'gravamenes' ? '⚖️ Gravámenes ▲' : '📋 Antecedentes ▲');
+    return;
+  }
+  // Show parent extras-row if this is a nombre-result panel
+  const folioPart = containerId.replace(/^(grav|ant)-n?/, '');
+  const parentRow = document.getElementById('extras-row-' + folioPart);
+  if (parentRow) parentRow.style.display = '';
+  // First load
+  el.style.display = 'block';
+  el.innerHTML = '<div style="color:#64748b;font-size:.8rem;padding:.4rem 0"><span class="spinner"></span> Consultando RPP...</div>';
+  const btn = document.getElementById('btn-' + containerId);
+  if (btn) { btn.disabled = true; btn.textContent = tipo === 'gravamenes' ? '⚖️ Cargando...' : '📋 Cargando...'; }
+  try {
+    const url = tipo === 'gravamenes' ? '/gravamenes/consultar' : '/antecedentes/consultar';
+    const res = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({folio})});
+    const d = await res.json();
+    if (!res.ok) { el.innerHTML = `<div style="color:#f87171;font-size:.8rem">&#10060; ${d.error||'Error'}</div>`; }
+    else {
+      el.innerHTML = tipo === 'gravamenes' ? _renderGravamenes(d) : _renderAntecedentes(d, folio);
+      el.dataset.loaded = '1';
+    }
+  } catch(e) { el.innerHTML = `<div style="color:#f87171;font-size:.8rem">&#10060; Error de red</div>`; }
+  if (btn) { btn.disabled = false; btn.textContent = tipo === 'gravamenes' ? '⚖️ Gravámenes ▲' : '📋 Antecedentes ▲'; }
+}
+
+function _injectExtrasBar(containerEl, folio) {
+  const uid = 'f' + folio;
+  containerEl.innerHTML = `
+    <div style="margin-top:.9rem;border-top:1px solid #1e293b;padding-top:.7rem">
+      <div style="color:#475569;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.45rem">Consultas registrales</div>
+      <div style="display:flex;gap:.45rem;flex-wrap:wrap">
+        <button id="btn-grav-${uid}" onclick="toggleExtrasSection('grav-${uid}','${folio}','gravamenes')"
+          style="background:#1e1b4b;border:1px solid #4c1d95;color:#a78bfa;border-radius:8px;padding:.3rem .75rem;font-size:.8rem;cursor:pointer">⚖️ Gravámenes ▼</button>
+        <button id="btn-ant-${uid}" onclick="toggleExtrasSection('ant-${uid}','${folio}','antecedentes')"
+          style="background:#1c1407;border:1px solid #92400e;color:#fbbf24;border-radius:8px;padding:.3rem .75rem;font-size:.8rem;cursor:pointer">📋 Antecedentes ▼</button>
+      </div>
+      <div id="grav-${uid}" style="display:none;margin-top:.6rem;padding:.6rem;background:#0a0f1e;border-radius:8px;border:1px solid #1e1b4b"></div>
+      <div id="ant-${uid}" style="display:none;margin-top:.5rem;padding:.6rem;background:#0a0f1e;border-radius:8px;border:1px solid #1c1a0a"></div>
+    </div>`;
+}
+
+
+// ── SAT / RFC ─────────────────────────────────────────────────────────────────
+function satTipoChange() {
+  const tipo = document.querySelector('input[name="sat-tipo"]:checked')?.value || 'F';
+  const docRow = document.getElementById('sat-doc-row');
+  if (docRow) docRow.style.display = tipo === 'F' ? 'flex' : 'none';
+}
+
+async function buscarSAT() {
+  const value    = (document.getElementById('sat-value').value || '').trim().toUpperCase();
+  const tipo     = document.querySelector('input[name="sat-tipo"]:checked')?.value || 'F';
+  const doc_type = document.querySelector('input[name="sat-doc"]:checked')?.value  || 'RFC';
+  const btn      = document.getElementById('btn-sat');
+  const statusEl = document.getElementById('sat-status');
+  const resultEl = document.getElementById('sat-result');
+
+  if (!value) {
+    statusEl.className = 'error'; statusEl.style.display = 'block';
+    statusEl.innerHTML = '&#10060; Ingresa un RFC o CURP.'; return;
+  }
+  btn.disabled = true;
+  resultEl.innerHTML = '';
+  statusEl.className = 'loading'; statusEl.style.display = 'block';
+  statusEl.innerHTML = '<span class="spinner"></span>Consultando SAT… cargando portal y resolviendo captcha (~15-20s)<div class="bar"><div class="fill"></div></div>';
+  _showCancel('sat');
+
+  try {
+    const res = await fetch('/sat/consultar', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value, tipo, doc_type}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      statusEl.className = 'error'; statusEl.innerHTML = '&#10060; ' + (err.error || 'Error');
+      btn.disabled = false; _hideCancel('sat'); return;
+    }
+    const {job_id} = await res.json();
+    _searchState.sat.poll = setInterval(async () => {
+      try {
+        const sr = await fetch('/status/' + job_id);
+        const s  = await sr.json();
+        if (s.status === 'done') {
+          clearInterval(_searchState.sat.poll); _searchState.sat.poll = null; _hideCancel('sat');
+          btn.disabled = false;
+          const r = s.result || {};
+          if (r.found) {
+            statusEl.className = 'success';
+            statusEl.innerHTML = '&#10003; Consulta SAT completada';
+          } else {
+            statusEl.className = 'error';
+            statusEl.innerHTML = '&#10060; ' + (r.estatus || 'No localizado');
+          }
+          // Render result card
+          const fields = [
+            r.tipo_persona && ['Tipo de persona', r.tipo_persona],
+            r.rfc          && ['RFC',              r.rfc],
+            r.curp         && ['CURP',             r.curp],
+            r.nombre       && ['Nombre / Razón Social', r.nombre],
+            r.estatus      && ['Estatus',          r.estatus],
+          ].filter(Boolean);
+          if (fields.length) {
+            const color = r.found ? '#4ade80' : '#f87171';
+            let html = '<div style="background:#0e1425;border:1px solid #1e2d40;border-radius:10px;padding:1rem;margin-top:.75rem">';
+            html += '<div style="font-size:.78rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.7rem">Resultado SAT</div>';
+            for (const [k,v] of fields) {
+              const isEstatus = k === 'Estatus';
+              html += `<div style="display:flex;justify-content:space-between;align-items:baseline;padding:.35rem 0;border-bottom:1px solid #1a2535">
+                <span style="color:#64748b;font-size:.82rem">${k}</span>
+                <span style="color:${isEstatus ? color : '#e2e8f0'};font-size:.85rem;font-weight:${isEstatus?'600':'400'};text-align:right;max-width:65%">${v}</span>
+              </div>`;
+            }
+            html += '</div>';
+            resultEl.innerHTML = html;
+          }
+        } else if (s.status === 'error') {
+          clearInterval(_searchState.sat.poll); _searchState.sat.poll = null; _hideCancel('sat');
+          statusEl.className = 'error';
+          statusEl.innerHTML = '&#10060; ' + s.error;
+          btn.disabled = false;
+        }
+      } catch(e) {
+        clearInterval(_searchState.sat.poll); _searchState.sat.poll = null; _hideCancel('sat');
+        statusEl.className = 'error'; statusEl.innerHTML = '&#10060; Error de red: ' + e.message;
+        btn.disabled = false;
+      }
+    }, 3000);
+  } catch(e) {
+    statusEl.className = 'error'; statusEl.innerHTML = '&#10060; Error: ' + e.message;
+    btn.disabled = false; _hideCancel('sat');
+  }
+}
+
+// ── Predial ───────────────────────────────────────────────────────────────────
+async function buscarPredial() {
+  const clave = (document.getElementById('predial-clave').value || '').trim();
+  const statusEl = document.getElementById('predial-status');
+  const resultEl = document.getElementById('predial-result');
+  if (!clave) {
+    statusEl.className = 'error'; statusEl.style.display = 'block';
+    statusEl.innerHTML = '&#10060; Ingresa la clave catastral.'; return;
+  }
+  const btn = document.getElementById('btn-predial');
+  btn.disabled = true;
+  statusEl.className = 'loading'; statusEl.style.display = 'block';
+  statusEl.innerHTML = '<span class="spinner"></span>Consultando Predial...';
+  resultEl.innerHTML = '';
+  const _ctrl = new AbortController();
+  _searchState.predial.ctrl = _ctrl;
+  _showCancel('predial');
+  try {
+    const res = await fetch('/predial/consultar', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({clave}),
+      signal: _ctrl.signal
+    });
+    _searchState.predial.ctrl = null; _hideCancel('predial');
+    const d = await res.json();
+    if (!res.ok) {
+      statusEl.className = 'error';
+      statusEl.innerHTML = '&#10060; ' + (d.error || 'Error al consultar');
+      btn.disabled = false; return;
+    }
+    statusEl.style.display = 'none';
     btn.disabled = false;
+    const adeudo = parseFloat(d.adeudo_total || 0);
+    const adeudoColor = adeudo > 0 ? '#f87171' : '#4ade80';
+    const tdL = 'style="color:#94a3b8;padding:.3rem .5rem;width:40%;vertical-align:top"';
+    const tdR = 'style="color:#f1f5f9;padding:.3rem .5rem"';
+    const descuentoRow = (d.aplica_descuento && d.aplica_descuento.toUpperCase() === 'SI')
+      ? `<tr><td ${tdL}>Descuento disponible</td><td style="color:#4ade80;padding:.3rem .5rem;font-weight:600">✓ Aplica descuento</td></tr>`
+      : '';
+    resultEl.innerHTML = `
+      <div style="background:#0f172a;border:1px solid #059669;border-radius:12px;padding:1.2rem;margin-top:.75rem">
+        <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:1rem">
+          <span style="font-size:1.4rem">🏠</span>
+          <h3 style="margin:0;color:#34d399;font-size:1rem">Predial Municipal – Chihuahua</h3>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:.88rem">
+          <tr><td ${tdL}>Clave catastral</td><td style="color:#f1f5f9;padding:.3rem .5rem;font-weight:600;font-size:.8rem">${d.clave_completa || clave}</td></tr>
+          ${d.propietario ? `<tr><td ${tdL}>Propietario</td><td ${tdR}>${d.propietario}</td></tr>` : ''}
+          ${d.ubicacion   ? `<tr><td ${tdL}>Ubicación</td><td style="color:#f1f5f9;padding:.3rem .5rem;font-size:.82rem">${d.ubicacion}</td></tr>` : ''}
+          ${descuentoRow}
+          <tr style="border-top:1px solid #1e3a5f">
+            <td style="color:#94a3b8;padding:.5rem .5rem;vertical-align:middle">Adeudo total</td>
+            <td style="padding:.5rem .5rem;font-size:1.2rem;font-weight:700;color:${adeudoColor}">
+              ${adeudo > 0 ? '$' + adeudo.toLocaleString('es-MX', {minimumFractionDigits:2}) + ' MXN' : '✓ Al corriente'}
+            </td>
+          </tr>
+        </table>
+        <div style="margin-top:.75rem">
+          ${d.edo_cta_url ? `
+          <button id="btn-edo-cta"
+            onclick="descargarEstadoCuenta(this)"
+            data-url="${encodeURIComponent(d.edo_cta_url || '')}"
+            data-key="${encodeURIComponent(d.edo_cta_key || '')}"
+            style="background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff;border:none;border-radius:8px;padding:.5rem 1.1rem;font-size:.85rem;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:.45rem;width:100%;justify-content:center">
+            <span>&#128196;</span> Descargar estado de cuenta
+          </button>` : ''}
+        </div>
+      </div>`;
+  } catch(e) {
+    if (e.name === 'AbortError') return;
+    statusEl.className = 'error';
+    statusEl.innerHTML = '&#10060; Error de red: ' + e.message;
+    btn.disabled = false; _hideCancel('predial');
+  }
+}
+
+// ── Predial: descargar estado de cuenta ──────────────────────────────────────
+async function descargarEstadoCuenta(btnEl) {
+  const key = decodeURIComponent(btnEl.getAttribute('data-key') || '');
+  const url = decodeURIComponent(btnEl.getAttribute('data-url') || '');
+  if (!key && !url) return;
+  btnEl.disabled = true;
+  btnEl.innerHTML = '<span class="spinner" style="width:14px;height:14px;border-width:2px"></span> Descargando...';
+  const params = {};
+  if (key) params.key = key;
+  if (url) params.url = url;
+  try {
+    const res = await fetch('/predial/estado-cuenta?' + new URLSearchParams(params));
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      alert('Error: ' + (d.error || res.statusText));
+      btnEl.disabled = false;
+      btnEl.innerHTML = '&#128196; Descargar estado de cuenta';
+      return;
+    }
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'estado_de_cuenta_predial.pdf';
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+    btnEl.innerHTML = '&#10003; Descargado';
+    btnEl.style.background = 'linear-gradient(135deg,#059669,#047857)';
+  } catch(e) {
+    alert('Error de red: ' + e.message);
+    btnEl.disabled = false;
+    btnEl.innerHTML = '&#128196; Descargar estado de cuenta';
   }
 }
 
@@ -5101,6 +5804,10 @@ function toggleTheme() {
 // ── Escape key: close any open modal/panel ────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
+  const antPrev = document.getElementById('anteced-preview-overlay');
+  if (antPrev && antPrev.classList.contains('open')) { closeAntecedPreview(); return; }
+  const antQuota = document.getElementById('anteced-quota-modal');
+  if (antQuota && antQuota.style.display !== 'none' && antQuota.style.display !== '') { closeAntecedQuotaModal(); return; }
   const preview = document.getElementById('preview-overlay');
   if (preview && preview.classList.contains('open')) { closePreview(); return; }
   const acct = document.getElementById('acct-panel');
@@ -5376,9 +6083,70 @@ def _fetch_pdf_for_folio_inner(folio_real: str) -> bytes:
 
         response  = context.request.get(pdf_url)
         pdf_bytes = response.body()
+
+        # ── Fetch inscription PDF ───────────────────────────────────────────────
+        # Flow: click "Ver Inscripción" → portal calls verificarInscripcion →
+        # obtenerInscripcionesPart → viewer loads ObtenerDocumentoPorId?DOC_TRAMITE_ID=X
+        # We capture that last URL via response listener and download the PDF.
+        insc_bytes = None
+        try:
+            _insc_urls = []
+            def _on_insc_resp(resp):
+                try:
+                    _insc_urls.append(resp.url)
+                except Exception: pass
+            page.on('response', _on_insc_resp)
+
+            # Click "Ver Inscripción" via instant JS (no timeout waits)
+            _clicked = page.evaluate("""
+                (() => {
+                    const needles = ['Ver Inscripci\u00f3n','Ver Inscripcion',
+                                     'VER INSCRIPCI\u00d3N','VER INSCRIPCION'];
+                    for (const n of needles) {
+                        const el = Array.from(document.querySelectorAll('*'))
+                            .find(e => e.children.length === 0 && e.textContent.trim() === n);
+                        if (el) { el.click(); return true; }
+                    }
+                    for (const n of needles) {
+                        const el = Array.from(document.querySelectorAll('a,button,span,div'))
+                            .find(e => e.textContent.trim() === n);
+                        if (el) { el.click(); return true; }
+                    }
+                    return false;
+                })()
+            """)
+
+            if _clicked:
+                # Wait for the portal to load the inscription viewer (ObtenerDocumentoPorId)
+                page.wait_for_timeout(5000)
+                # Find the inscription document URL — prioritise ObtenerDocumentoPorId
+                _insc_url = None
+                for _u in _insc_urls:
+                    if 'ObtenerDocumentoPorId' in _u or 'obtenerDocumentoPorId' in _u:
+                        _insc_url = _u
+                        break
+                # Fallback: any URL that returns a PDF
+                if not _insc_url:
+                    for _u in _insc_urls:
+                        if any(k in _u for k in ['Reporte', 'reporte', 'Obtener', 'obtener']):
+                            try:
+                                _tr = context.request.get(_u, timeout=10000)
+                                if _tr.body()[:4] == b'%PDF':
+                                    _insc_url = _u
+                                    break
+                            except Exception:
+                                pass
+                if _insc_url:
+                    _ir = context.request.get(_insc_url, timeout=20000)
+                    _ib = _ir.body()
+                    if _ib[:4] == b'%PDF':
+                        insc_bytes = _ib
+        except Exception as _e_insc:
+            print(f'[RPP] inscripcion fetch skipped: {_e_insc}', flush=True)
+
         browser.close()
     _rpp_metric('folio_fetch', folio_real, int((time.time() - _t0) * 1000), True)
-    return pdf_bytes
+    return {'escritura': pdf_bytes, 'inscripcion': insc_bytes}
 
 
 # Apply retry wrapper
@@ -6056,7 +6824,7 @@ FORGOT_PW_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="card">
-  <div class="logo">Consulta RPP</div>
+  <div class="logo"><img src="/static/logo_clean.png" alt="Consulta RPP" style="height:54px;object-fit:contain"></div>
   <p class="sub">Recuperación de contraseña</p>
   {% if msg %}
     <div class="ok">{{ msg }}</div>
@@ -6113,7 +6881,7 @@ RESET_PW_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="card">
-  <div class="logo">Consulta RPP</div>
+  <div class="logo"><img src="/static/logo_clean.png" alt="Consulta RPP" style="height:54px;object-fit:contain"></div>
   <p class="sub">Nueva contraseña</p>
   {% if done %}
     <div class="ok">Contraseña actualizada correctamente.</div>
@@ -6281,7 +7049,7 @@ def pwa_manifest():
 @app.route('/sw.js')
 def service_worker():
     sw = """
-const CACHE = 'rpp-v9';
+const CACHE = 'rpp-v18';
 const PRECACHE = ['/app.js'];
 
 self.addEventListener('install', e => {
@@ -7304,6 +8072,7 @@ def track_event():
 
 
 @app.route('/webhook/stripe', methods=['POST'])
+@app.route('/stripe-webhook', methods=['POST'])
 def stripe_webhook():
     if check_webhook_rate():
         return 'rate limited', 429
@@ -7698,15 +8467,18 @@ def buscar():
 
     def run():
         try:
-            cached = _get_cached_pdf(folio)
-            if cached:
+            cached_pdf, cached_insc = _get_cached_pdf(folio)
+            if cached_pdf:
                 _rpp_pool_stats['cache_hits'] += 1
-                _job_set(job_id, {'status': 'done', 'pdf': cached})
+                _job_set(job_id, {'status': 'done', 'pdf': cached_pdf, 'inscripcion_pdf': cached_insc})
                 return
-            raw_pdf   = fetch_pdf_for_folio(folio)
+            result    = fetch_pdf_for_folio(folio)
+            raw_pdf   = result['escritura']
+            insc_raw  = result.get('inscripcion')
             clean_pdf = remove_watermarks(raw_pdf)
-            _set_cached_pdf(folio, clean_pdf)
-            _job_set(job_id, {'status': 'done', 'pdf': clean_pdf})
+            insc_pdf  = remove_watermarks(insc_raw) if insc_raw else None
+            _set_cached_pdf(folio, clean_pdf, insc_pdf)
+            _job_set(job_id, {'status': 'done', 'pdf': clean_pdf, 'inscripcion_pdf': insc_pdf})
         except ValueError as e:
             _job_set(job_id, {'status': 'error', 'error': str(e)})
         except Exception as e:
@@ -7764,7 +8536,9 @@ def job_status(job_id):
     if job['status'] == 'done':
         if job.get('type') == 'nombre':
             return jsonify({'status': 'done', 'results': job['results']})
-        return jsonify({'status': 'done'})
+        if job.get('type') == 'sat':
+            return jsonify({'status': 'done', 'result': job['result']})
+        return jsonify({'status': 'done', 'has_inscripcion': bool(job.get('inscripcion_pdf'))})
     return jsonify({'status': job['status']})
 
 
@@ -7834,9 +8608,18 @@ def buscar_lote():
             jid = item['job_id']
             f   = item['folio']
             try:
-                raw_pdf   = fetch_pdf_for_folio(f)
+                cached_pdf, cached_insc = _get_cached_pdf(f)
+                if cached_pdf:
+                    _rpp_pool_stats['cache_hits'] += 1
+                    _job_set(jid, {'status': 'done', 'pdf': cached_pdf, 'inscripcion_pdf': cached_insc})
+                    continue
+                result    = fetch_pdf_for_folio(f)
+                raw_pdf   = result['escritura']
+                insc_raw  = result.get('inscripcion')
                 clean_pdf = remove_watermarks(raw_pdf)
-                _job_set(jid, {'status': 'done', 'pdf': clean_pdf})
+                insc_pdf  = remove_watermarks(insc_raw) if insc_raw else None
+                _set_cached_pdf(f, clean_pdf, insc_pdf)
+                _job_set(jid, {'status': 'done', 'pdf': clean_pdf, 'inscripcion_pdf': insc_pdf})
             except ValueError as e:
                 _job_set(jid, {'status': 'error', 'error': str(e)})
             except Exception as e:
@@ -7878,6 +8661,23 @@ def download(job_id):
     )
 
 
+@app.route('/download/<job_id>/inscripcion')
+def download_inscripcion(job_id):
+    u = current_user()
+    if not u:
+        return redirect(url_for('login_page'))
+    job = _job_get(job_id)
+    if not job or job['status'] != 'done' or not job.get('inscripcion_pdf'):
+        return jsonify({'error': 'Inscripción no disponible'}), 404
+    folio = job.get('folio', 'folio')
+    return send_file(
+        io.BytesIO(job['inscripcion_pdf']),
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=f'inscripcion_{folio}.pdf',
+    )
+
+
 # ── Términos y Condiciones ─────────────────────────────────────────────────────
 @app.route('/terminos')
 def terminos():
@@ -7906,7 +8706,7 @@ def terminos():
 </head><body>
 
 <nav class="nav">
-  <a href="/" class="nav-logo">📋 Consulta RPP</a>
+  <a href="/" class="nav-logo"><img src="/static/logo_clean.png" alt="Consulta RPP" style="height:32px;object-fit:contain;vertical-align:middle"></a>
   <a href="/" class="nav-back">← Volver al inicio</a>
 </nav>
 
@@ -9049,11 +9849,12 @@ os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
 
 
 def _get_cached_pdf(folio):
-    """Check memory cache first, then disk cache."""
+    """Check memory cache first, then disk cache.
+    Returns (pdf_bytes, insc_bytes) tuple — insc_bytes may be None."""
     # Memory cache
     entry = _pdf_cache.get(folio)
     if entry and time.time() - entry['ts'] < PDF_CACHE_TTL:
-        return entry['pdf']
+        return entry['pdf'], entry.get('inscripcion')
     # Disk cache
     safe_name = ''.join(c for c in str(folio) if c.isalnum() or c in '-_')
     disk_path = os.path.join(_DISK_CACHE_DIR, f'{safe_name}.pdf')
@@ -9063,24 +9864,39 @@ def _get_cached_pdf(folio):
             if file_age < PDF_CACHE_TTL:
                 with open(disk_path, 'rb') as f:
                     pdf_bytes = f.read()
+                # Try to load inscription from disk too
+                insc_bytes = None
+                insc_path = os.path.join(_DISK_CACHE_DIR, f'{safe_name}_insc.pdf')
+                try:
+                    if os.path.exists(insc_path):
+                        with open(insc_path, 'rb') as fi:
+                            insc_bytes = fi.read()
+                except Exception:
+                    pass
                 # Promote to memory cache
-                _pdf_cache[folio] = {'pdf': pdf_bytes, 'ts': time.time() - file_age}
-                return pdf_bytes
+                _pdf_cache[folio] = {'pdf': pdf_bytes, 'ts': time.time() - file_age, 'inscripcion': insc_bytes}
+                return pdf_bytes, insc_bytes
             else:
                 # Expired — clean up
                 os.remove(disk_path)
+                insc_path = os.path.join(_DISK_CACHE_DIR, f'{safe_name}_insc.pdf')
+                try:
+                    if os.path.exists(insc_path):
+                        os.remove(insc_path)
+                except Exception:
+                    pass
     except Exception:
         pass
-    return None
+    return None, None
 
 
-def _set_cached_pdf(folio, pdf_bytes):
+def _set_cached_pdf(folio, pdf_bytes, insc_bytes=None):
     """Save to both memory and disk cache."""
     # Memory cache — keep under 200 entries
     if len(_pdf_cache) > 200:
         oldest = min(_pdf_cache, key=lambda k: _pdf_cache[k]['ts'])
         del _pdf_cache[oldest]
-    _pdf_cache[folio] = {'pdf': pdf_bytes, 'ts': time.time()}
+    _pdf_cache[folio] = {'pdf': pdf_bytes, 'ts': time.time(), 'inscripcion': insc_bytes}
     # Disk cache
     safe_name = ''.join(c for c in str(folio) if c.isalnum() or c in '-_')
     disk_path = os.path.join(_DISK_CACHE_DIR, f'{safe_name}.pdf')
@@ -9089,6 +9905,13 @@ def _set_cached_pdf(folio, pdf_bytes):
             f.write(pdf_bytes)
     except Exception as e:
         print(f'[CACHE] Disk write error: {e}', flush=True)
+    if insc_bytes:
+        insc_path = os.path.join(_DISK_CACHE_DIR, f'{safe_name}_insc.pdf')
+        try:
+            with open(insc_path, 'wb') as fi:
+                fi.write(insc_bytes)
+        except Exception as e:
+            print(f'[CACHE] Disk write insc error: {e}', flush=True)
 
 
 def _cleanup_disk_cache():
@@ -9312,6 +10135,1135 @@ def agua_consultar():
         'monto':     monto_m.group(1) if monto_m else '0',
         'referencia': ref_m.group(1) if ref_m else '',
     })
+
+
+# ── Gravámenes scraper ─────────────────────────────────────────────────────────
+
+def _fetch_gravamenes_inner(folio_real: str) -> list:
+    global _rpp_login_time
+    if not _rpp_health_check():
+        raise ValueError("El servicio RPP Chihuahua no responde.")
+    _rpp_pool_stats['launches'] += 1
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+        context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
+        page = context.new_page()
+        _login_and_open_consulta(page)
+        _rpp_pool_stats['logins'] += 1
+        _rpp_login_time = time.time()
+        try:
+            page.wait_for_function(
+                '() => Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]").length > 0',
+                timeout=30000
+            )
+        except Exception:
+            browser.close()
+            raise ValueError("Formulario de folio no apareció")
+        input_id = page.evaluate('Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]")[0].getInputId()')
+        page.fill(f'#{input_id}', str(folio_real))
+        page.wait_for_timeout(200)
+        _ext_dom_click(page, 'Buscar')
+        try:
+            page.wait_for_function(
+                '() => Array.from(document.querySelectorAll("*")).some(e => e.textContent.trim() === "Ver Agregado")',
+                timeout=30000
+            )
+        except Exception:
+            browser.close()
+            raise ValueError("Folio no encontrado en el registro")
+        # Give the bottom panel time to populate
+        page.wait_for_timeout(2000)
+        # Click Gravámenes tab
+        page.evaluate("""
+            const el = Array.from(document.querySelectorAll('.x-tab-inner'))
+                .find(e => e.textContent.trim() === 'Grav\u00e1menes');
+            if (el) el.click();
+        """)
+        page.wait_for_timeout(800)
+        data = page.evaluate("""
+            (() => {
+                const s = Ext.StoreMgr.get('strBAGravamenes');
+                if (!s) return [];
+                return s.getRange(0, 100).map(r => {
+                    const d = r.data;
+                    return {
+                        fecha: d.FECHA_REGISTRO || '',
+                        acto: d.ACTO || '',
+                        inscripcion: (d.INSCRIPCION || '').toString().trim(),
+                        libro: (d.LIBRO || '').toString().trim(),
+                        seccion: d.SECCION || '',
+                        distrito: d.DISTRITO || '',
+                        partida: d.PARTIDA || '',
+                        vigente: d.VIGENTE || '',
+                        monto: d.MONTO || '',
+                        datosActo: (d.DATOSACTO || '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim()
+                    };
+                });
+            })()
+        """)
+        browser.close()
+    return data
+
+fetch_gravamenes = _retry_rpp(_fetch_gravamenes_inner, max_retries=2, backoff_base=3)
+
+
+def _fetch_antecedentes_inner(folio_real: str) -> list:
+    global _rpp_login_time
+    if not _rpp_health_check():
+        raise ValueError("El servicio RPP Chihuahua no responde.")
+    _rpp_pool_stats['launches'] += 1
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+        context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
+        page = context.new_page()
+        _login_and_open_consulta(page)
+        _rpp_pool_stats['logins'] += 1
+        _rpp_login_time = time.time()
+        try:
+            page.wait_for_function(
+                '() => Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]").length > 0',
+                timeout=30000
+            )
+        except Exception:
+            browser.close()
+            raise ValueError("Formulario de folio no apareció")
+        input_id = page.evaluate('Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]")[0].getInputId()')
+        page.fill(f'#{input_id}', str(folio_real))
+        page.wait_for_timeout(200)
+        _ext_dom_click(page, 'Buscar')
+        try:
+            page.wait_for_function(
+                '() => Array.from(document.querySelectorAll("*")).some(e => e.textContent.trim() === "Ver Agregado")',
+                timeout=30000
+            )
+        except Exception:
+            browser.close()
+            raise ValueError("Folio no encontrado en el registro")
+        page.wait_for_timeout(2000)
+        # Click Antecedentes tab
+        page.evaluate("""
+            const el = Array.from(document.querySelectorAll('.x-tab-inner'))
+                .find(e => e.textContent.trim() === 'Antecedentes');
+            if (el) el.click();
+        """)
+        # Wait until the store has records (up to 8 s) instead of a fixed sleep
+        try:
+            page.wait_for_function(
+                """() => {
+                    const s = Ext.StoreMgr.get('strBAMovimientoInm');
+                    return s && s.getCount() > 0;
+                }""",
+                timeout=8000
+            )
+        except Exception:
+            pass  # store may be genuinely empty; let the map return []
+        data = page.evaluate("""
+            (() => {
+                const s = Ext.StoreMgr.get('strBAMovimientoInm');
+                if (!s) return [];
+                return s.getRange(0, 200)
+                    .filter(r => parseInt(r.data.PARTIDA || 0) > 0)
+                    .map(r => {
+                        const d = r.data;
+                        const ins = (d.INSCRIPCION || '').toString().trim();
+                        return {
+                            fecha: d.FECHA_REGISTRO || '',
+                            acto: (d.ACTO || '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim(),
+                            inscripcion: ins,
+                            libro: (d.LIBRO || '').toString().trim(),
+                            seccion: d.SECCION || '',
+                            distrito: d.DISTRITO || '',
+                            estatus: d.ESTATUS_INSC_DESCR || d.VIGENTE || '',
+                            datosActo: (d.DATOSACTO || '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim(),
+                            tieneAgregado: d.TIENE_AGREGADO === 'S',
+                            partida: parseInt(d.PARTIDA) || 0,
+                            loteId: parseInt(d.LOTE_ID || 0) || 0
+                        };
+                    });
+            })()
+        """)
+        browser.close()
+    return data
+
+fetch_antecedentes = _retry_rpp(_fetch_antecedentes_inner, max_retries=2, backoff_base=3)
+
+# ── SAT RFC / CURP validator ──────────────────────────────────────────────────
+_SAT_URL   = 'https://agsc.siat.sat.gob.mx/PTSC/ConsultaIdCSIAT/'
+# Proxy with Mexican IP — format: 'http://user:pass@host:port'  or  'socks5://host:port'
+# Set via env var SAT_PROXY on the server.  Leave blank = direct (will fail from US VPS).
+_SAT_PROXY = os.environ.get('SAT_PROXY', '')
+
+def _solve_captcha_2captcha(img_b64: str) -> str:
+    """Send base64 CAPTCHA image to 2captcha and return solved text."""
+    import requests as _req
+    if not TWOCAPTCHA_KEY:
+        raise ValueError("Clave de 2captcha no configurada (TWOCAPTCHA_KEY)")
+    # Submit task
+    r = _req.post('https://2captcha.com/in.php', data={
+        'key': TWOCAPTCHA_KEY, 'method': 'base64', 'body': img_b64,
+        'json': 1, 'numeric': 0, 'min_len': 4, 'max_len': 6,
+    }, timeout=30)
+    r.raise_for_status()
+    d = r.json()
+    if d.get('status') != 1:
+        raise ValueError(f"2captcha envío error: {d.get('request')}")
+    task_id = d['request']
+    # Wait 5s before first poll (typical minimum solve time)
+    time.sleep(5)
+    # Poll every 1.5s for up to 40 seconds total
+    for _ in range(24):
+        r = _req.get('https://2captcha.com/res.php', params={
+            'key': TWOCAPTCHA_KEY, 'action': 'get', 'id': task_id, 'json': 1,
+        }, timeout=15)
+        d = r.json()
+        if d.get('status') == 1:
+            return str(d['request'])
+        if d.get('request') != 'CAPCHA_NOT_READY':
+            raise ValueError(f"2captcha error: {d.get('request')}")
+        time.sleep(1.5)
+    raise ValueError("2captcha: tiempo de espera agotado")
+
+
+def _fetch_sat_contribuyente_inner(value: str, tipo: str, doc_type: str) -> dict:
+    """
+    Query SAT ConsultaIdCSIAT (agsc.siat.sat.gob.mx).
+    tipo: 'F' (Física) | 'M' (Moral)
+    doc_type: 'RFC' | 'CURP'  (CURP only valid when tipo='F')
+    Returns dict with keys: found, estatus, tipo_persona, nombre, rfc, curp
+    """
+    import re as _re
+
+    if not _SAT_PROXY:
+        raise ValueError(
+            "SAT_PROXY no configurado — el portal SAT requiere IP mexicana. "
+            "Configura SAT_PROXY en el servicio (ej. http://user:pass@proxy-mx:port)."
+        )
+
+    for _attempt in range(3):
+        with sync_playwright() as p:
+            _proxy_cfg = {'server': _SAT_PROXY} if _SAT_PROXY else None
+            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS,
+                                        proxy=_proxy_cfg)
+            ctx     = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
+            page    = ctx.new_page()
+            try:
+                # Use 'commit' so we don't wait for all resources, then
+                # explicitly wait for the form to appear (up to 60s)
+                try:
+                    page.goto(_SAT_URL, wait_until='commit', timeout=60000)
+                except Exception:
+                    page.goto(_SAT_URL, wait_until='commit', timeout=60000)
+                # Wait for the form / captcha image to be present
+                try:
+                    page.wait_for_selector('#captchaSession', timeout=30000)
+                except Exception:
+                    page.wait_for_timeout(5000)
+
+                # ── Select tipo de persona ────────────────────────────────────
+                tipo_idx = '0' if tipo == 'F' else '1'
+                page.evaluate(f"""
+                    (() => {{
+                        const r = document.querySelector('[id="formapp:tipo:{tipo_idx}"]');
+                        if (r) r.click();
+                    }})()
+                """)
+                page.wait_for_timeout(600)
+
+                # ── Select doc type (RFC vs CURP, only for Física) ───────────
+                if tipo == 'F':
+                    doc_idx = '0' if doc_type == 'RFC' else '1'
+                    page.evaluate(f"""
+                        (() => {{
+                            const r = document.querySelector('[id="formapp:doc:{doc_idx}"]');
+                            if (r) r.click();
+                        }})()
+                    """)
+                    page.wait_for_timeout(600)
+
+                # ── Fill value ────────────────────────────────────────────────
+                page.evaluate("""
+                    ((v) => {
+                        const el = document.querySelector('[id="formapp:val"]');
+                        if (el) { el.focus(); el.value = v; el.dispatchEvent(new Event('input')); }
+                    })
+                """ + f"({repr(value)})")
+
+                # ── Extract inline base64 CAPTCHA ─────────────────────────────
+                captcha_b64 = page.evaluate("""
+                    (() => {
+                        const el = document.getElementById('captchaSession');
+                        if (el && el.src && el.src.startsWith('data:'))
+                            return el.src.split(',')[1];
+                        return null;
+                    })()
+                """)
+                if not captcha_b64:
+                    browser.close()
+                    raise ValueError("No se pudo obtener el captcha del portal SAT")
+
+                # ── Solve with 2captcha ───────────────────────────────────────
+                captcha_sol = _solve_captcha_2captcha(captcha_b64)
+                print(f'[SAT] captcha solved: {captcha_sol}', flush=True)
+
+                # ── Fill captcha answer ───────────────────────────────────────
+                # The captcha field ID contains JSF autogenerated part (j_idtXX).
+                # Find it by maxlength=5 text input near the captcha image.
+                page.evaluate(f"""
+                    ((sol) => {{
+                        // Try known ID pattern first
+                        let el = document.querySelector('[id*="captcha"][type="text"]');
+                        // Fallback: find text input with maxlength 5
+                        if (!el) {{
+                            el = Array.from(document.querySelectorAll('input[type="text"]'))
+                                .find(i => i.maxLength === 5);
+                        }}
+                        if (el) {{
+                            el.focus(); el.value = sol;
+                            el.dispatchEvent(new Event('input'));
+                            el.dispatchEvent(new Event('change'));
+                        }}
+                    }})({repr(captcha_sol)})
+                """)
+
+                # ── Click submit ("Consultar") ────────────────────────────────
+                page.evaluate("""
+                    (() => {
+                        // Try known ID first
+                        let btn = document.querySelector('[id="formapp:j_idt42"]');
+                        // Fallback: button with text "Consultar"
+                        if (!btn) {
+                            btn = Array.from(document.querySelectorAll('button,input[type="submit"],input[type="button"]'))
+                                .find(b => (b.textContent||b.value||'').trim() === 'Consultar');
+                        }
+                        if (btn) btn.click();
+                    })()
+                """)
+                # Wait for result to appear (up to 8s)
+                try:
+                    page.wait_for_function(
+                        "() => document.body.innerText.includes('Resultado') || "
+                        "document.body.innerText.includes('Registrado') || "
+                        "document.body.innerText.includes('No localizado') || "
+                        "document.body.innerText.includes('Cancelado')",
+                        timeout=8000
+                    )
+                except Exception:
+                    page.wait_for_timeout(3000)
+
+                body = page.evaluate('document.body.innerText')
+                browser.close()
+
+                # ── Detect captcha failure ────────────────────────────────────
+                if ('Resultado' not in body and 'Registrado' not in body
+                        and 'No localizado' not in body and 'Cancelado' not in body):
+                    print(f'[SAT] attempt {_attempt+1} failed (bad captcha?)', flush=True)
+                    if _attempt < 2:
+                        time.sleep(1)
+                        continue
+                    return {
+                        'found': False,
+                        'estatus': 'Error de captcha — intenta de nuevo',
+                        'tipo_persona': '', 'nombre': '', 'rfc': '', 'curp': '',
+                    }
+
+                # ── Parse result ──────────────────────────────────────────────
+                def _ext(pattern, text, default=''):
+                    m = _re.search(pattern, text, _re.IGNORECASE | _re.MULTILINE)
+                    return m.group(1).strip() if m else default
+
+                result = {
+                    'found':        'Registrado' in body,
+                    'tipo_persona': _ext(r'Tipo de persona[:\s]+([^\n]+)', body),
+                    'curp':         _ext(r'CURP[:\s]+([A-Z0-9]{18})', body),
+                    'rfc':          _ext(r'\bRFC[:\s]+([A-Z&\xd1]{3,4}\d{6}[A-Z0-9]{3})', body),
+                    'nombre':       _ext(r'(?:Nombre|Raz[oó]n Social)[^:\n]*[:\s]+([^\n]+)', body),
+                    'estatus':      _ext(r'Estatus[:\s]+([^\n]+)', body),
+                }
+                if not result['estatus']:
+                    if 'No localizado' in body:
+                        result['estatus'] = 'No localizado en el padrón de contribuyentes.'
+                    elif 'Cancelado' in body:
+                        result['estatus'] = 'Cancelado'
+                    elif result['found']:
+                        result['estatus'] = 'Registrado en el padrón de contribuyentes.'
+                print(f'[SAT] result: {result}', flush=True)
+                return result
+
+            except Exception as _e:
+                try: browser.close()
+                except Exception: pass
+                if _attempt < 2:
+                    time.sleep(3)
+                    continue
+                raise ValueError(f"Error consultando SAT: {_e}")
+
+    raise ValueError("No se pudo consultar el SAT después de 3 intentos")
+
+
+# ── In-memory cache for estado de cuenta PDFs ────────────────────────────────
+_edo_cta_cache: dict = {}   # {cache_key: {'bytes': bytes, 'ts': float}}
+_EDO_CTA_CACHE_TTL = 600    # 10 minutes
+
+# ── In-memory cache for antecedente docs (avoids double-fetch for preview+download) ──
+_anteced_cache: dict = {}        # {(folio, str(partida)): ({'agregado': bytes, 'inscripcion': bytes|None}, float)}
+_anteced_cache_lock = threading.Lock()
+_ANTECED_CACHE_TTL = 600         # seconds
+
+def _get_cached_anteced(folio: str, partida: int):
+    key = (folio, str(partida))
+    with _anteced_cache_lock:
+        if key in _anteced_cache:
+            data, ts = _anteced_cache[key]
+            if time.time() - ts < _ANTECED_CACHE_TTL:
+                return data
+            del _anteced_cache[key]
+    return None
+
+def _set_cached_anteced(folio: str, partida: int, data: dict):
+    key = (folio, str(partida))
+    with _anteced_cache_lock:
+        # Evict entries older than TTL to avoid unbounded growth
+        now = time.time()
+        stale = [k for k, (_, ts) in _anteced_cache.items() if now - ts >= _ANTECED_CACHE_TTL]
+        for k in stale:
+            del _anteced_cache[k]
+        _anteced_cache[key] = (data, now)
+
+
+def _fetch_antecedente_doc_inner(folio_real: str, partida: int) -> dict:
+    """Fetch escritura (agregado) + optional inscripción for a partida.
+
+    Returns {'agregado': bytes, 'inscripcion': bytes|None}.
+    Caches the result for _ANTECED_CACHE_TTL seconds.
+    """
+    import base64 as _b64
+    global _rpp_login_time
+
+    cached = _get_cached_anteced(folio_real, partida)
+    if cached is not None:
+        return cached
+
+    if not _rpp_health_check():
+        raise ValueError("El servicio RPP Chihuahua no responde.")
+    _rpp_pool_stats['launches'] += 1
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+        context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
+        page = context.new_page()
+        _login_and_open_consulta(page)
+        _rpp_pool_stats['logins'] += 1
+        _rpp_login_time = time.time()
+
+        result_b64 = page.evaluate(f"""
+            (async () => {{
+                async function fetchPdf(url) {{
+                    try {{
+                        const r = await fetch(url, {{credentials: 'include'}});
+                        if (!r.ok) return null;
+                        const buf = await r.arrayBuffer();
+                        const bytes = new Uint8Array(buf);
+                        if (bytes.length < 200) return null;
+                        // Must start with %PDF
+                        if (bytes[0] !== 37 || bytes[1] !== 80 || bytes[2] !== 68 || bytes[3] !== 70) return null;
+                        let s = '';
+                        for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+                        return btoa(s);
+                    }} catch(e) {{ return null; }}
+                }}
+
+                // 1. Fetch escritura (agregado)
+                const agregadoB64 = await fetchPdf(
+                    '/rpp/WebAPI/Servicios/CopiasCertificadas/ObtenerAgregadoPorPartida?partida={partida}'
+                );
+                if (!agregadoB64) return {{ok: false, msg: 'agregado_not_found'}};
+
+                // 2. Try to fetch inscripción alongside (best-effort, several candidate URLs)
+                const inscEndpoints = [
+                    '/rpp/WebAPI/Servicios/CopiasCertificadas/ObtenerInscripcionPorPartida?partida={partida}',
+                    '/rpp/WebAPI/Servicios/CopiasCertificadas/ObtenerConstanciaPorPartida?partida={partida}',
+                    '/rpp/WebAPI/Servicios/Reportes/ObtienePDFInscripcionMant?PARTIDA={partida}',
+                ];
+                let inscB64 = null;
+                for (const ep of inscEndpoints) {{
+                    inscB64 = await fetchPdf(ep);
+                    if (inscB64) break;
+                }}
+
+                return {{ok: true, agregado: agregadoB64, inscripcion: inscB64}};
+            }})()
+        """)
+        browser.close()
+
+    if not result_b64 or not result_b64.get('ok'):
+        msg = (result_b64 or {}).get('msg', 'unknown')
+        raise ValueError(
+            f"El documento no está disponible ({msg}). "
+            "Puede que no esté digitalizado en el sistema RPP."
+        )
+
+    data = {
+        'agregado':    _b64.b64decode(result_b64['agregado']),
+        'inscripcion': _b64.b64decode(result_b64['inscripcion']) if result_b64.get('inscripcion') else None,
+    }
+    _set_cached_anteced(folio_real, partida, data)
+    return data
+
+
+@app.route('/antecedentes/preview')
+@login_required
+def antecedentes_preview():
+    """Return 1-page preview PDF for an antecedente document. No quota deduction."""
+    from flask import Response as _Response
+    folio   = (request.args.get('folio') or '').strip()
+    partida_raw = request.args.get('partida', '')
+    try:
+        partida = int(partida_raw)
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Partida inválida'}), 400
+    if not folio or partida <= 0:
+        return jsonify({'error': 'Parámetros inválidos'}), 400
+    try:
+        docs = _fetch_antecedente_doc_inner(folio, partida)
+        pdf_bytes = docs['agregado']
+        # Truncate to first page for preview
+        try:
+            from pypdf import PdfReader, PdfWriter
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            writer = PdfWriter()
+            writer.add_page(reader.pages[0])
+            buf = io.BytesIO()
+            writer.write(buf)
+            preview_bytes = buf.getvalue()
+        except Exception:
+            preview_bytes = pdf_bytes
+        return _Response(
+            preview_bytes,
+            mimetype='application/pdf',
+            headers={'Cache-Control': 'no-store'}
+        )
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        return jsonify({'error': f'Error interno: {e}'}), 500
+
+
+@app.route('/antecedentes/documento', methods=['POST'])
+@login_required
+def antecedentes_documento():
+    import zipfile as _zf
+    from flask import Response as _Response
+    u = current_user()
+
+    data = request.get_json() or {}
+    folio   = (data.get('folio') or '').strip()
+    partida_raw = data.get('partida')
+    if not folio or partida_raw is None:
+        return jsonify({'error': 'Proporciona el folio y partida'}), 400
+    try:
+        partida = int(partida_raw)
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Partida inválida'}), 400
+    if partida <= 0:
+        return jsonify({'error': 'Partida inválida'}), 400
+
+    # ── Plan/quota check ──────────────────────────────────────────────────────
+    PAID_PLANS = {'basico', 'pro', 'empresarial', 'corporativo', 'corporativo_pro'}
+    if u['role'] != 'admin':
+        is_team = bool(get_corporate_owner_id(u['id']))
+        has_plan = (
+            is_team or
+            u.get('in_trial') or
+            (u.get('sub_status') == 'active' and u.get('plan') in PAID_PLANS)
+        )
+        if not has_plan:
+            return jsonify({'error': 'Requiere plan Básico o superior', 'no_plan': True}), 402
+
+        dl = get_dl_info(u)
+        if dl['left'] <= 0:
+            return jsonify({'error': 'Sin créditos de descarga este mes', 'no_quota': True,
+                            'downloads_left': 0}), 402
+
+    # ── Fetch docs ────────────────────────────────────────────────────────────
+    try:
+        docs = _fetch_antecedente_doc_inner(folio, partida)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        return jsonify({'error': f'Error interno: {e}'}), 500
+
+    # ── Record download (deduct quota) ────────────────────────────────────────
+    if u['role'] != 'admin':
+        dl = get_dl_info(u)   # re-check (may have changed)
+        record_dl(u['id'], folio, dl.get('use_extra', False), dl.get('use_pack', False),
+                  nombre=f'partida_{partida}')
+
+    # ── Build response: ZIP if inscripción available, otherwise plain PDF ─────
+    agregado    = docs['agregado']
+    inscripcion = docs.get('inscripcion')
+
+    if inscripcion:
+        buf = io.BytesIO()
+        with _zf.ZipFile(buf, 'w', _zf.ZIP_DEFLATED) as zf:
+            zf.writestr(f'escritura_{partida}.pdf',    agregado)
+            zf.writestr(f'inscripcion_{partida}.pdf',  inscripcion)
+        buf.seek(0)
+        return _Response(
+            buf.read(),
+            mimetype='application/zip',
+            headers={
+                'Content-Disposition': f'attachment; filename=documentos_{partida}.zip',
+            }
+        )
+    else:
+        return _Response(
+            agregado,
+            mimetype='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename=escritura_{partida}.pdf',
+                'Content-Length': str(len(agregado))
+            }
+        )
+
+
+@app.route('/gravamenes/consultar', methods=['POST'])
+@login_required
+def gravamenes_consultar():
+    data = request.get_json() or {}
+    folio = (data.get('folio') or '').strip()
+    if not folio:
+        return jsonify({'error': 'Proporciona el folio real'}), 400
+    try:
+        gravamenes = fetch_gravamenes(folio)
+        return jsonify({'gravamenes': gravamenes})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        return jsonify({'error': f'Error interno: {e}'}), 500
+
+
+@app.route('/antecedentes/consultar', methods=['POST'])
+@login_required
+def antecedentes_consultar():
+    data = request.get_json() or {}
+    folio = (data.get('folio') or '').strip()
+    if not folio:
+        return jsonify({'error': 'Proporciona el folio real'}), 400
+    try:
+        antecedentes = fetch_antecedentes(folio)
+        return jsonify({'antecedentes': antecedentes})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        return jsonify({'error': f'Error interno: {e}'}), 500
+
+
+# ── Predial scraper ────────────────────────────────────────────────────────────
+
+# serviciosExternos initialises the ADF session correctly before the predial task-flow
+PREDIAL_URL = ('https://predialcuu.mpiochih.gob.mx/re_serviciosinternet/faces/'
+               'serviciosExternos?claveServicio=PR')
+
+
+def _fetch_predial_inner(clave_catastral: str) -> dict:
+    import re as _re
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+        context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
+        page = context.new_page()
+
+        # ── URL capture (no context.route — does NOT touch main page load) ───
+        edo_cta_ref = {'url': None}
+
+        def _on_new_page(new_pg):
+            """Fires when window.open() creates a popup in the same context."""
+            # Route all requests on the new page — first nav will be the PDF URL
+            def _rh(route):
+                u = route.request.url
+                if not edo_cta_ref['url']:
+                    edo_cta_ref['url'] = u
+                try: route.abort()
+                except Exception:
+                    try: route.continue_()
+                    except Exception: pass
+            try:
+                new_pg.route('**', _rh)
+            except Exception:
+                pass
+            # Also grab URL from framenavigated event
+            def _on_nav(frame):
+                u = frame.url or ''
+                if u and 'blank' not in u and 'about:' not in u:
+                    if not edo_cta_ref['url']:
+                        edo_cta_ref['url'] = u
+            try:
+                new_pg.on('framenavigated', _on_nav)
+            except Exception:
+                pass
+
+        # Listen for popups on both the page and the context
+        page.on('popup', _on_new_page)
+        context.on('page', _on_new_page)
+
+        # Also catch if main page navigates directly to the report URL
+        def _on_main_nav(frame):
+            try:
+                u = frame.url or ''
+                if ('RE_ReportProvider' in u or 'reportprovider' in u.lower()) \
+                        and not edo_cta_ref['url']:
+                    edo_cta_ref['url'] = u
+            except Exception:
+                pass
+        page.on('framenavigated', _on_main_nav)
+
+        page.goto(PREDIAL_URL, wait_until='domcontentloaded', timeout=40000)
+
+        # Wait for ADF form — portal renders "Capture su clave catastral"
+        try:
+            page.wait_for_function(
+                '() => document.body.innerText.includes("Capture su clave catastral")',
+                timeout=30000
+            )
+        except Exception:
+            browser.close()
+            raise ValueError("El portal de predial no respondió")
+
+        page.wait_for_timeout(800)
+
+        # Fill input — real rendered HTML id is pt1:it1::content
+        inp = page.query_selector('#pt1\\:it1\\:\\:content, input[type="text"]')
+        if not inp:
+            browser.close()
+            raise ValueError("No se encontró el campo de clave catastral")
+        inp.fill(clave_catastral)
+        page.wait_for_timeout(300)
+
+        # Click Continuar — confirmed id = pt1:cb1
+        page.evaluate("document.getElementById('pt1:cb1')?.click()")
+
+        # Wait for any of: results page, no-adeudo dialog, or not-found message
+        try:
+            page.wait_for_function(
+                """() => {
+                    const t = document.body.innerText.toLowerCase();
+                    return t.includes('datos del predio')
+                        || t.includes('no tiene adeudo')
+                        || t.includes('no encontrada')
+                        || t.includes('clave no encontrada');
+                }""",
+                timeout=25000
+            )
+        except Exception:
+            browser.close()
+            raise ValueError("No se obtuvo respuesta del portal predial")
+
+        body_text = page.evaluate('document.body.innerText')
+
+        # ADF PPR loads fields asynchronously — wait for "Adeudo total:" before reading
+        if 'datos del predio' in body_text.lower():
+            try:
+                page.wait_for_function(
+                    "() => document.body.innerText.includes('Adeudo total:')",
+                    timeout=12000
+                )
+            except Exception:
+                pass  # timeout: read whatever is available
+            # Extra pause so PPR finishes rendering all buttons
+            page.wait_for_timeout(2000)
+            body_text = page.evaluate('document.body.innerText')
+
+        # ── Extract estado de cuenta URL ───────────────────────────────────────
+        # The portal flow after "Datos del predio" is:
+        #   1. Click "Siguiente" → payment-options page loads
+        #   2. Click "Imprimir estado de cuenta para pago" → URL captured
+        edo_cta_url = ''
+        if 'datos del predio' in body_text.lower():
+
+            # Step 1 — click "Siguiente"
+            _sig_clicked = False
+            for _sig in ['Siguiente', 'siguiente']:
+                try:
+                    page.get_by_text(_sig, exact=False).first.click(timeout=3000)
+                    _sig_clicked = True
+                    break
+                except Exception:
+                    pass
+            if not _sig_clicked:
+                page.evaluate("""
+                    () => {
+                        for (const el of document.querySelectorAll(
+                                'a,button,input[type=button],input[type=submit],' +
+                                'span[role=button],div[role=button]')) {
+                            if ((el.textContent||el.value||'').toLowerCase().includes('siguiente'))
+                                { el.click(); return; }
+                        }
+                    }
+                """)
+
+            # Wait for payment-options page ("Imprimir estado de cuenta")
+            try:
+                page.wait_for_function(
+                    "() => document.body.innerText.toLowerCase().includes('imprimir estado de cuenta')",
+                    timeout=12000
+                )
+            except Exception:
+                pass
+            page.wait_for_timeout(1000)
+
+            # Step 2 — click "Imprimir estado de cuenta para pago"
+            for _imp in ['Imprimir estado de cuenta para pago',
+                         'Imprimir estado de cuenta',
+                         'Imprimir']:
+                try:
+                    page.get_by_text(_imp, exact=False).first.click(timeout=3000)
+                    page.wait_for_timeout(6000)
+                    if edo_cta_ref['url']:
+                        break
+                except Exception:
+                    pass
+
+            # JS fallback
+            if not edo_cta_ref['url']:
+                page.evaluate("""
+                    () => {
+                        const kw = ['imprimir','estado','cuenta'];
+                        for (const el of document.querySelectorAll(
+                                'a,button,input[type=button],input[type=submit],' +
+                                'span[role=button],div[role=button],td[onclick]')) {
+                            const t = (el.textContent||el.value||el.title||'').toLowerCase();
+                            if (kw.some(k=>t.includes(k))) { el.click(); return; }
+                        }
+                    }
+                """)
+                page.wait_for_timeout(6000)
+
+        edo_cta_url = edo_cta_ref['url'] or ''
+
+        # ── Fetch PDF bytes NOW while ADF session cookies are still alive ─────
+        edo_cta_key = ''
+        if edo_cta_url:
+            try:
+                api_resp = context.request.get(
+                    edo_cta_url,
+                    headers={'Referer': 'https://predialcuu.mpiochih.gob.mx/'},
+                    timeout=30000,
+                )
+                pdf_bytes = api_resp.body()
+                if pdf_bytes[:4] == b'%PDF':    # valid PDF
+                    import hashlib as _hl
+                    edo_cta_key = _hl.md5(clave_catastral.encode()).hexdigest()
+                    _edo_cta_cache[edo_cta_key] = {
+                        'bytes': pdf_bytes,
+                        'ts': time.time(),
+                    }
+            except Exception:
+                pass
+
+        browser.close()
+
+    # Case: property found but NO debt ─ portal shows dialog on search page
+    if 'no tiene adeudo' in body_text.lower():
+        clave_m = _re.search(r'Clave catastral:\s*(.+)', body_text)
+        return {
+            'clave_completa':   clave_m.group(1).strip() if clave_m else clave_catastral,
+            'propietario':      '', 'ubicacion':        '',
+            'adeudo_total':     '0', 'aplica_descuento': '',
+            'al_corriente':     True,
+            'edo_cta_url':      edo_cta_url or '',
+            'edo_cta_key':      edo_cta_key,
+        }
+
+    # Case: not found
+    if 'no encontrada' in body_text.lower() or 'datos del predio' not in body_text.lower():
+        raise ValueError(f"Clave catastral no encontrada: {clave_catastral}")
+
+    # Extract fields from results page
+    clave_m       = _re.search(r'Clave catastral:\s*(.+)',        body_text)
+    propietario_m = _re.search(r'Propietario:\s*(.+)',            body_text)
+    ubicacion_m   = _re.search(r'Ubicaci[oó]n:\s*(.+)',           body_text)
+    descuento_m   = _re.search(r'Aplica descuento:\s*(.+)',          body_text)
+    adeudo_m      = _re.search(r'Adeudo total:\s*\$?([\d,]+\.?\d*)', body_text)
+
+    return {
+        'clave_completa':   clave_m.group(1).strip()           if clave_m       else '',
+        'propietario':      propietario_m.group(1).strip()     if propietario_m else '',
+        'ubicacion':        ubicacion_m.group(1).strip()       if ubicacion_m   else '',
+        'adeudo_total':     adeudo_m.group(1).replace(',', '') if adeudo_m      else '0',
+        'aplica_descuento': descuento_m.group(1).strip()       if descuento_m   else '',
+        'al_corriente':     False,
+        'edo_cta_url':      edo_cta_url or '',
+        'edo_cta_key':      edo_cta_key,
+    }
+
+fetch_predial = _retry_rpp(_fetch_predial_inner, max_retries=2, backoff_base=3)
+
+
+@app.route('/sat/consultar', methods=['POST'])
+@login_required
+def sat_consultar():
+    u = current_user()
+    data      = request.get_json() or {}
+    value     = (data.get('value', '') or '').strip().upper().replace(' ', '')
+    tipo      = (data.get('tipo', 'F') or 'F').upper()
+    doc_type  = (data.get('doc_type', 'RFC') or 'RFC').upper()
+    if not value:
+        return jsonify({'error': 'Ingresa un RFC o CURP'}), 400
+    if tipo not in ('F', 'M'):
+        tipo = 'F'
+    if doc_type not in ('RFC', 'CURP'):
+        doc_type = 'RFC'
+    if not TWOCAPTCHA_KEY:
+        return jsonify({'error': 'Servicio SAT no configurado — contacta al administrador'}), 503
+    _cleanup_old_jobs()
+    job_id = str(uuid.uuid4())
+    _job_create(job_id, {'status': 'running', 'result': None, 'error': None,
+                         'type': 'sat', 'ts': time.time()})
+    def run():
+        try:
+            result = _fetch_sat_contribuyente_inner(value, tipo, doc_type)
+            _job_set(job_id, {'status': 'done', 'result': result})
+        except Exception as e:
+            _job_set(job_id, {'status': 'error', 'error': str(e)})
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/predial/consultar', methods=['POST'])
+@login_required
+def predial_consultar():
+    data = request.get_json() or {}
+    clave = (data.get('clave') or '').strip()
+    if not clave:
+        return jsonify({'error': 'Proporciona la clave catastral'}), 400
+    try:
+        result = fetch_predial(clave)
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        return jsonify({'error': f'Error interno: {e}'}), 500
+
+
+@app.route('/predial/estado-cuenta', methods=['GET'])
+@login_required
+def predial_estado_cuenta():
+    """Download the estado de cuenta PDF from the predial portal.
+    Requires ?url=<the RE_ReportProvider URL returned by /predial/consultar>
+    Strategy: try direct HTTP request first (Oracle ADF report providers often
+    work purely from URL params). Fall back to full Playwright session if needed.
+    """
+    from flask import Response as _Resp
+
+    # ── Priority: serve from in-memory cache (PDF was fetched during consultar) ──
+    cache_key = request.args.get('key', '').strip()
+    if cache_key:
+        entry = _edo_cta_cache.get(cache_key)
+        if entry and (time.time() - entry['ts']) < _EDO_CTA_CACHE_TTL:
+            return _Resp(
+                entry['bytes'],
+                status=200,
+                mimetype='application/pdf',
+                headers={'Content-Disposition': 'attachment; filename="estado_de_cuenta_predial.pdf"'}
+            )
+
+    # ── Fallback: direct HTTP request (works if report server is stateless) ──
+    edo_url = request.args.get('url', '').strip()
+    if not edo_url:
+        return jsonify({'error': 'PDF expirado — vuelve a consultar la clave catastral'}), 400
+
+    try:
+        import requests as _req, urllib3 as _u3
+        _u3.disable_warnings()
+        r = _req.get(
+            edo_url,
+            headers={
+                'User-Agent': _USER_AGENT,
+                'Referer': 'https://predialcuu.mpiochih.gob.mx/',
+                'Accept': 'application/pdf,*/*;q=0.8',
+            },
+            verify=False, timeout=30, allow_redirects=True,
+        )
+        if r.status_code == 200 and r.content[:4] == b'%PDF':
+            return _Resp(
+                r.content,
+                status=200,
+                mimetype='application/pdf',
+                headers={'Content-Disposition': 'attachment; filename="estado_de_cuenta_predial.pdf"'}
+            )
+    except Exception:
+        pass
+
+    return jsonify({'error': 'PDF expirado — vuelve a consultar la clave catastral para regenerarlo'}), 410
+
+
+@app.route('/guia')
+def guia():
+    """Printable How-To guide — accessible without login."""
+    return render_template_string(r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Guía de uso — Consulta RPP Chihuahua</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#0f172a;color:#e2e8f0;line-height:1.6}
+.page{max-width:900px;margin:0 auto;padding:2rem 1.5rem}
+.header{display:flex;align-items:center;gap:1.2rem;padding:1.5rem 2rem;background:#1e293b;border-radius:16px;margin-bottom:2rem;border:1px solid #334155}
+.header img{height:60px}
+.header-text h1{font-size:1.6rem;font-weight:800;color:#f1f5f9}
+.header-text p{font-size:.9rem;color:#94a3b8;margin-top:.2rem}
+.badge{display:inline-block;background:#15803d;color:#86efac;font-size:.75rem;font-weight:700;padding:.2rem .6rem;border-radius:6px;margin-left:.6rem}
+.section{background:#1e293b;border-radius:12px;padding:1.5rem 2rem;margin-bottom:1.5rem;border:1px solid #334155}
+.section h2{font-size:1.1rem;font-weight:700;color:#a78bfa;margin-bottom:1rem;display:flex;align-items:center;gap:.5rem}
+.section h2 span{font-size:1.4rem}
+.step{display:flex;gap:1rem;margin-bottom:1rem;align-items:flex-start}
+.step-num{min-width:32px;height:32px;border-radius:50%;background:#7c3aed;color:#fff;font-weight:700;font-size:.85rem;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:.1rem}
+.step-body h3{font-size:.95rem;font-weight:700;color:#f1f5f9;margin-bottom:.2rem}
+.step-body p{font-size:.875rem;color:#94a3b8}
+.step-body code{background:#0f172a;color:#22c55e;padding:.1rem .4rem;border-radius:4px;font-size:.82rem}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.feat-card{background:#0f172a;border-radius:10px;padding:1rem 1.2rem;border:1px solid #334155}
+.feat-card .icon{font-size:1.5rem;margin-bottom:.4rem}
+.feat-card h3{font-size:.9rem;font-weight:700;color:#f1f5f9;margin-bottom:.3rem}
+.feat-card p{font-size:.8rem;color:#94a3b8}
+.tip{background:#0c1a2e;border-left:3px solid #22c55e;border-radius:6px;padding:.8rem 1rem;font-size:.85rem;color:#86efac;margin-top:.8rem}
+.tip strong{color:#4ade80}
+.plans{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:.8rem;margin-top:.5rem}
+.plan{background:#0f172a;border-radius:10px;padding:1rem;border:1px solid #334155;text-align:center}
+.plan.highlight{border-color:#7c3aed}
+.plan-name{font-weight:700;font-size:.95rem;color:#c084fc;margin-bottom:.3rem}
+.plan-price{font-size:1.25rem;font-weight:800;color:#f1f5f9}
+.plan-price span{font-size:.75rem;color:#64748b}
+.plan-limit{font-size:.78rem;color:#94a3b8;margin-top:.3rem}
+.footer{text-align:center;padding:1.5rem;color:#475569;font-size:.8rem}
+.footer a{color:#7c3aed}
+.print-btn{position:fixed;bottom:1.5rem;right:1.5rem;background:#7c3aed;color:#fff;border:none;padding:.8rem 1.5rem;border-radius:10px;font-size:.9rem;font-weight:700;cursor:pointer;box-shadow:0 4px 20px rgba(124,58,237,.5)}
+.print-btn:hover{background:#6d28d9}
+.new-tag{display:inline-block;background:#15803d;color:#86efac;font-size:.65rem;font-weight:700;padding:.1rem .4rem;border-radius:4px;margin-left:.4rem;vertical-align:middle}
+@media print{
+  body{background:#fff;color:#111}
+  .page{padding:0}
+  .header,.section,.feat-card,.plan{background:#f8f9fa!important;border-color:#dee2e6!important}
+  .header-text h1,.step-body h3,.feat-card h3,.plan-name{color:#111!important}
+  .step-body p,.feat-card p,.plan-limit{color:#555!important}
+  .header-text p,.plan-price{color:#333!important}
+  .section h2{color:#5b21b6!important}
+  .tip{background:#f0fff4!important;color:#166534!important;border-color:#22c55e!important}
+  .print-btn{display:none}
+  .badge{background:#166534!important}
+  code{background:#f1f5f9!important;color:#166534!important}
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="header">
+  <img src="/static/logo_clean.png" alt="RPP Logo">
+  <div class="header-text">
+    <h1>Consulta RPP Chihuahua <span class="badge">Guía 2026</span></h1>
+    <p>Manual de uso del sistema — Escrituras, inscripciones, predial y validación fiscal</p>
+  </div>
+</div>
+
+<!-- INICIO DE SESIÓN -->
+<div class="section">
+  <h2><span>🔐</span> 1. Inicio de sesión</h2>
+  <div class="step"><div class="step-num">1</div><div class="step-body"><h3>Accede a la plataforma</h3><p>Visita <code>consultarpp.com</code> y haz clic en <strong>Iniciar sesión</strong>. Puedes entrar con tu cuenta de <strong>Google</strong> (recomendado) o con correo + contraseña.</p></div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-body"><h3>Prueba gratuita</h3><p>Al registrarte obtienes <strong>3 días de prueba gratis</strong> sin tarjeta de crédito. El sistema te asignará descargas de muestra para explorar todas las funciones.</p></div></div>
+  <div class="tip"><strong>Consejo:</strong> Si tu empresa usa varios usuarios, el plan Corporativo incluye hasta 100 descargas/mes y sub-cuentas para tu equipo.</div>
+</div>
+
+<!-- BÚSQUEDA POR FOLIO -->
+<div class="section">
+  <h2><span>🔍</span> 2. Búsqueda por Folio Real</h2>
+  <div class="step"><div class="step-num">1</div><div class="step-body"><h3>Ingresa el folio</h3><p>En el tab <strong>Folio Real</strong>, escribe el número de folio (ej. <code>1698469</code>) y presiona <strong>Enter</strong> o el botón Buscar.</p></div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-body"><h3>Espera la consulta</h3><p>El sistema accede al portal del RPP Chihuahua en segundo plano. Verás una barra de progreso. El tiempo promedio es de <strong>15 a 30 segundos</strong>.</p></div></div>
+  <div class="step"><div class="step-num">3</div><div class="step-body"><h3>Descarga automática</h3><p>Al terminar, el PDF de la <strong>escritura</strong> se descarga automáticamente sin marca de agua. Si el folio tiene inscripción registrada, la <strong>inscripción</strong> también se descarga por separado.</p></div></div>
+  <div class="tip"><strong>Botón cancelar:</strong> Haz clic en <strong>✕</strong> durante la búsqueda para cancelarla si ya no la necesitas.</div>
+</div>
+
+<!-- BÚSQUEDA POR NOMBRE -->
+<div class="section">
+  <h2><span>👤</span> 3. Búsqueda por Nombre de Propietario</h2>
+  <div class="step"><div class="step-num">1</div><div class="step-body"><h3>Escribe el nombre</h3><p>En el tab <strong>Nombre</strong>, ingresa el nombre del propietario (ej. <code>HERNANDEZ GARCIA</code>). No necesitas mayúsculas exactas.</p></div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-body"><h3>Selecciona el resultado</h3><p>El sistema mostrará una lista de coincidencias con folio, propietario y municipio. Haz clic en <strong>⬇ Escritura</strong> para descargar el PDF.</p></div></div>
+  <div class="step"><div class="step-num">3</div><div class="step-body"><h3>Inscripción disponible <span class="new-tag">NUEVO</span></h3><p>Si el predio tiene inscripción, aparecerá el botón <strong>⬇ Insc.</strong> (azul) junto a la escritura. Ambos PDFs se descargan de forma independiente.</p></div></div>
+</div>
+
+<!-- BÚSQUEDA POR LOTE -->
+<div class="section">
+  <h2><span>🗂</span> 4. Búsqueda por Lote / Clave Catastral</h2>
+  <div class="step"><div class="step-num">1</div><div class="step-body"><h3>Datos del lote</h3><p>Llena los campos de <strong>Municipio</strong>, <strong>Fraccionamiento / Colonia</strong>, <strong>Manzana</strong> y <strong>Lote</strong>. También puedes buscar por clave catastral completa.</p></div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-body"><h3>Ver resultados</h3><p>Los predios que coincidan aparecerán en la tabla. Haz clic en el botón de descarga para obtener el PDF correspondiente.</p></div></div>
+</div>
+
+<!-- PREDIAL -->
+<div class="section">
+  <h2><span>💰</span> 6. Consulta de Predial</h2>
+  <div class="step"><div class="step-num">1</div><div class="step-body"><h3>Ingresa la clave catastral</h3><p>En el tab <strong>Predial</strong>, escribe la clave catastral del inmueble. El sistema consultará el sistema municipal de Chihuahua.</p></div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-body"><h3>Estado de cuenta</h3><p>Verás el estado de cuenta con saldo adeudado, año fiscal y montos. Puedes descargar el <strong>Estado de Cuenta PDF</strong> para presentarlo en trámites.</p></div></div>
+</div>
+
+<!-- HISTORIAL Y ALERTAS -->
+<div class="section">
+  <h2><span>🔔</span> 7. Alertas y Historial</h2>
+  <div class="grid2">
+    <div class="feat-card">
+      <div class="icon">📋</div>
+      <h3>Historial de descargas</h3>
+      <p>Accede a <strong>Historial</strong> en el menú para ver todos los folios que has consultado. Puedes re-descargar cualquier PDF sin usar créditos adicionales.</p>
+    </div>
+    <div class="feat-card">
+      <div class="icon">🔔</div>
+      <h3>Alertas de cambio</h3>
+      <p>Activa alertas en un folio con el botón <strong>🔔 Alertar</strong>. Recibirás un correo si el RPP registra cambios en ese predio.</p>
+    </div>
+  </div>
+</div>
+
+<!-- FUNCIONES PRINCIPALES -->
+<div class="section">
+  <h2><span>⚡</span> 8. Funciones principales</h2>
+  <div class="grid2">
+    <div class="feat-card"><div class="icon">📄</div><h3>PDF sin marca de agua</h3><p>Todos los documentos se entregan limpios, sin el sello de agua del portal oficial.</p></div>
+    <div class="feat-card"><div class="icon">📄</div><h3>Inscripción separada <span class="new-tag">NUEVO</span></h3><p>El PDF de inscripción se descarga automáticamente por separado de la escritura.</p></div>
+    <div class="feat-card"><div class="icon">🚫</div><h3>Cancelar búsqueda</h3><p>Haz clic en <strong>✕ Cancelar</strong> para detener cualquier consulta en proceso.</p></div>
+    <div class="feat-card"><div class="icon">🌙</div><h3>Modo claro/oscuro</h3><p>Cambia entre tema oscuro y claro con el botón en la barra superior.</p></div>
+    <div class="feat-card"><div class="icon">📱</div><h3>Notificaciones</h3><p>Activa notificaciones del navegador para recibir alertas cuando una descarga esté lista.</p></div>
+    <div class="feat-card"><div class="icon">🔗</div><h3>Referidos</h3><p>Comparte tu enlace de referido desde <strong>Mis Referidos</strong> y gana créditos por cada nuevo usuario.</p></div>
+  </div>
+</div>
+
+<!-- PLANES -->
+<div class="section">
+  <h2><span>💳</span> 9. Planes y precios</h2>
+  <div class="plans">
+    <div class="plan"><div class="plan-name">Básico</div><div class="plan-price">$500<span>/mes MXN</span></div><div class="plan-limit">5 descargas/mes</div></div>
+    <div class="plan"><div class="plan-name">Pro</div><div class="plan-price">$1,000<span>/mes MXN</span></div><div class="plan-limit">10 descargas/mes</div></div>
+    <div class="plan highlight"><div class="plan-name">Empresarial</div><div class="plan-price">$2,000<span>/mes MXN</span></div><div class="plan-limit">20 descargas/mes</div></div>
+    <div class="plan"><div class="plan-name">Corporativo</div><div class="plan-price">$5,000<span>/mes MXN</span></div><div class="plan-limit">100 descargas/mes</div></div>
+  </div>
+  <div class="tip" style="margin-top:1rem"><strong>Paquetes extra:</strong> Puedes comprar créditos adicionales desde tu panel de cuenta sin cambiar de plan.</div>
+</div>
+
+<!-- SOPORTE -->
+<div class="section">
+  <h2><span>📞</span> 10. Soporte</h2>
+  <div class="step"><div class="step-num">✉</div><div class="step-body"><h3>Correo</h3><p>Escribe a <code>hola@javisnes.com</code> para cualquier duda o reporte de problema.</p></div></div>
+  <div class="step"><div class="step-num">💬</div><div class="step-body"><h3>WhatsApp</h3><p>Usuarios Pro y Empresarial tienen acceso a soporte por WhatsApp. Usa el botón verde en la esquina de la plataforma.</p></div></div>
+</div>
+
+<div class="footer">
+  <p>Consulta RPP Chihuahua &nbsp;·&nbsp; <a href="https://consultarpp.com">consultarpp.com</a> &nbsp;·&nbsp; Abril 2026</p>
+  <p style="margin-top:.4rem">Este documento es para uso interno de los usuarios de la plataforma.</p>
+</div>
+
+</div>
+<button class="print-btn" onclick="window.print()">🖨 Guardar como PDF</button>
+</body>
+</html>""")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
