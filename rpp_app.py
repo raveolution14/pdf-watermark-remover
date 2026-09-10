@@ -7,6 +7,9 @@ Google OAuth · Stripe subscriptions (MXN) · Anti-sharing session
 import io, threading, webbrowser, os, uuid, time, sqlite3, functools, json
 from collections import defaultdict
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo as _ZoneInfo
+_TZ_MX = _ZoneInfo('America/Mexico_City')
+def _now(): return datetime.now(_TZ_MX).replace(tzinfo=None)
 try:
     import anthropic as _anthropic
     _ANTHROPIC_AVAILABLE = True
@@ -33,11 +36,12 @@ ADMIN_EMAIL    = "fjhdezg@gmail.com"
 TWOCAPTCHA_KEY = os.environ.get('TWOCAPTCHA_KEY', '')
 
 app.config.update(
-    SECRET_KEY              = os.environ.get('FLASK_SECRET_KEY', 'rpp-dev-secret-CHANGE-ME'),
-    SESSION_COOKIE_HTTPONLY = True,
-    SESSION_COOKIE_SAMESITE = 'Lax',
-    SESSION_COOKIE_SECURE   = True,
-    SESSION_COOKIE_NAME     = 'rpp_sess',
+    SECRET_KEY                = os.environ.get('FLASK_SECRET_KEY', 'rpp-dev-secret-CHANGE-ME'),
+    SESSION_COOKIE_HTTPONLY   = True,
+    SESSION_COOKIE_SAMESITE   = 'Lax',
+    SESSION_COOKIE_SECURE     = True,
+    SESSION_COOKIE_NAME       = 'rpp_sess',
+    PERMANENT_SESSION_LIFETIME= timedelta(days=30),
 )
 
 GOOGLE_CLIENT_ID     = os.environ.get('GOOGLE_CLIENT_ID', '')
@@ -68,6 +72,35 @@ PACK_CONFIG = {
     'pack10': {'qty': 10, 'price_mxn': 900,  'label': '10 descargas — $900 MXN', 'save': 'Ahorra $400'},
 }
 PLAN_LIMITS = {'basico': 5, 'pro': 10, 'empresarial': 20, 'corporativo': 100, 'corporativo_pro': 500}
+
+# ── Referral anti-abuse ───────────────────────────────────────────────────────
+REFERRAL_MAX_CREDITS = 10  # max referral credits a single account can earn
+
+_DISPOSABLE_DOMAINS = {
+    'mailinator.com','guerrillamail.com','guerrillamail.net','guerrillamail.org',
+    'guerrillamail.de','guerrillamail.info','guerrillamailblock.com',
+    '10minutemail.com','10minutemail.net','10minutemail.org','10minutemail.co.uk',
+    'yopmail.com','yopmail.fr','yopmail.net',
+    'throwam.com','temp-mail.org','tempmail.com','tempmail.net','tempmail.org',
+    'trashmail.com','trashmail.me','trashmail.net','trashmail.at',
+    'trashmail.io','trashmail.xyz','trashmail.org','trashmail.de',
+    'fakeinbox.com','maildrop.cc','mailnull.com','spamgourmet.com',
+    'wegwerfmail.de','wegwerfmail.net','wegwerfmail.org',
+    'jetable.fr.nf','jetable.org','jetable.fr','spam4.me',
+    'discard.email','sharklasers.com','grr.la','mohmal.com',
+    'dispostable.com','mailexpire.com','tempr.email','tmaild.com',
+    'getairmail.com','filzmail.com','spamfree24.org','spamhereplease.com',
+    'spam.la','spaml.com','spamoff.de','anonbox.net','nospam.ze.tc',
+    'nospam4.us','throwaway.email','tempemail.com','mailtemp.info',
+    'tempmailo.com','inoutmail.de','inoutmail.eu','inoutmail.net',
+    # Dominios detectados en ataques reales
+    'necub.com','sixoplus.com','ryzid.com',
+    'soppat.com','donumart.com','4heats.com',
+}
+
+def _is_disposable_email(email: str) -> bool:
+    domain = email.split('@')[-1].lower() if '@' in email else ''
+    return domain in _DISPOSABLE_DOMAINS
 
 # Notion integration
 NOTION_API_KEY    = os.environ.get('NOTION_API_KEY', '')
@@ -231,6 +264,12 @@ with _db() as _c:
         emailed    INTEGER DEFAULT 0,
         ts         TEXT DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS no_plan_followup (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL UNIQUE,
+        emailed    INTEGER DEFAULT 0,
+        ts         TEXT DEFAULT (datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id    INTEGER NOT NULL,
@@ -276,13 +315,28 @@ with _db() as _c:
     );
     """)
 
+# Migration: add UNIQUE index on download_packs.payment_intent (deduplicate first)
+with _db() as _mig:
+    try:
+        _mig.execute("""DELETE FROM download_packs
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM download_packs
+                WHERE payment_intent IS NOT NULL
+                GROUP BY payment_intent
+            ) AND payment_intent IS NOT NULL""")
+        _mig.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_download_packs_pi ON download_packs(payment_intent)"
+        )
+    except Exception as _mig_err:
+        print(f'[MIGRATION] download_packs index: {_mig_err}', flush=True)
+
 # ── Automatic DB Backups ─────────────────────────────────────────────────────
 import glob as _glob_mod
 
 def _do_db_backup():
     backup_dir = os.path.join(os.path.dirname(DB_PATH), 'backups')
     os.makedirs(backup_dir, exist_ok=True)
-    ts  = datetime.utcnow().strftime('%Y%m%d')
+    ts  = _now().strftime('%Y%m%d')
     dst = os.path.join(backup_dir, f'rpp_{ts}.db')
     if not os.path.exists(dst):
         src = sqlite3.connect(DB_PATH, timeout=20)
@@ -327,11 +381,11 @@ def _check_rpp_status():
         with _ur.urlopen(req, timeout=10) as r:
             ms = int((time.time() - t0) * 1000)
         _rpp_status.update({'ok': True, 'response_ms': ms,
-                            'checked_at': datetime.utcnow().isoformat()[:19],
+                            'checked_at': _now().isoformat()[:19],
                             'message': ''})
     except Exception as e:
         _rpp_status.update({'ok': False, 'response_ms': 0,
-                            'checked_at': datetime.utcnow().isoformat()[:19],
+                            'checked_at': _now().isoformat()[:19],
                             'message': str(e)[:80]})
 
 _alert_state = {'consecutive_errors': 0, 'alerted': False, 'recovered': False}
@@ -344,7 +398,7 @@ def _send_rpp_alert(down=True):
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:1.5rem">
           <h2 style="color:{'#ef4444' if down else '#4ade80'}">{subject}</h2>
           <p>{'El servicio RPP Chihuahua no responde. Las consultas están fallando.' if down else 'El servicio RPP Chihuahua volvió a responder correctamente.'}</p>
-          <p style="color:#888;font-size:.85rem">Detectado: {datetime.utcnow().isoformat()[:19]} UTC</p>
+          <p style="color:#888;font-size:.85rem">Detectado: {_now().isoformat()[:19]} UTC</p>
         </div>"""
         threading.Thread(target=_smtp_send, args=(ADMIN_EMAIL, subject, body), daemon=True).start()
         print(f'[ALERT] RPP {"down" if down else "up"} — alert sent to {ADMIN_EMAIL}', flush=True)
@@ -404,7 +458,7 @@ def _track(event, uid, plan, meta=''):
 
 def _send_annual_renewal_reminders():
     """Send annual plan renewal warning emails at 30, 7 and 1 day before renewal."""
-    now = datetime.utcnow()
+    now = _now()
     with _db() as c:
         rows = c.execute(
             """SELECT id, email, name, plan, period_start, annual_reminder_sent
@@ -491,7 +545,7 @@ def _notion_sync_user(user_row):
             "Nombre": {"title": [{"text": {"content": user_row.get('name') or user_row['email']}}]},
             "Email": {"email": user_row['email']},
             "Descargas Usadas": {"number": user_row.get('downloads_used', 0)},
-            "Último Sync": {"date": {"start": datetime.utcnow().isoformat()[:19]}},
+            "Último Sync": {"date": {"start": _now().isoformat()[:19]}},
         }
         plan = user_row.get('plan')
         if plan and plan in ('basico', 'pro', 'empresarial', 'corporativo', 'corporativo_pro', 'admin'):
@@ -557,7 +611,7 @@ def current_user():
     d['in_trial'] = False
     if d.get('trial_ends') and d.get('sub_status') != 'active' and d['role'] != 'admin':
         try:
-            d['in_trial'] = datetime.fromisoformat(d['trial_ends']) > datetime.utcnow()
+            d['in_trial'] = datetime.fromisoformat(d['trial_ends']) > _now()
         except (ValueError, TypeError):
             pass
     return d
@@ -592,12 +646,23 @@ def sub_required(f):
 
 def _reset_period_if_due(uid):
     with _db() as c:
-        u = c.execute('SELECT period_start FROM users WHERE id=?', (uid,)).fetchone()
+        u = c.execute('SELECT period_start, plan, downloads_used, stripe_sub_id FROM users WHERE id=?', (uid,)).fetchone()
         if u and u['period_start']:
             ps = datetime.fromisoformat(u['period_start'])
-            if datetime.utcnow() >= ps + timedelta(days=30):
-                c.execute('UPDATE users SET downloads_used=0, period_start=? WHERE id=?',
-                          (datetime.utcnow().isoformat(), uid))
+            if _now() >= ps + timedelta(days=30):
+                if u['stripe_sub_id']:
+                    # Stripe user: rollover unused downloads to next period
+                    plan_limit = PLAN_LIMITS.get(u['plan'] or '', 0)
+                    used = u['downloads_used'] or 0
+                    new_used = min(0, used - plan_limit)  # negative = banked rollover
+                    c.execute('UPDATE users SET downloads_used=?, period_start=? WHERE id=?',
+                              (new_used, _now().isoformat(), uid))
+                else:
+                    # Manual-pay user: no new downloads — just advance period_start
+                    # so this check stops running, but downloads_used is NOT reset.
+                    # They can still use whatever downloads remain from their paid period.
+                    c.execute('UPDATE users SET period_start=? WHERE id=?',
+                              (_now().isoformat(), uid))
 
 def _get_pack_credits(c, user_id):
     """Get total available pack credits for a user."""
@@ -649,7 +714,7 @@ def link_corporate_member(email, user_id):
     with _db() as c:
         c.execute(
             'UPDATE corporate_members SET member_id=?, joined_at=? WHERE invite_email=? AND member_id IS NULL AND active=1',
-            (user_id, datetime.utcnow().isoformat(), email.lower()))
+            (user_id, _now().isoformat(), email.lower()))
 
 
 def get_dl_info(user):
@@ -663,7 +728,7 @@ def get_dl_info(user):
             owner = c.execute('SELECT * FROM users WHERE id=?', (owner_id,)).fetchone()
         if owner and owner['sub_status'] == 'active':
             limit        = PLAN_LIMITS.get(owner['plan'] or '', 0)
-            period_start = owner['period_start'] or datetime.utcnow().isoformat()
+            period_start = owner['period_start'] or _now().isoformat()
             used         = get_team_downloads_used(owner_id, period_start)
             left         = max(0, limit - used)
             return {'left': left, 'use_extra': False, 'use_pack': False,
@@ -673,8 +738,6 @@ def get_dl_info(user):
         u = c.execute('SELECT downloads_used, plan FROM users WHERE id=?',
                       (user['id'],)).fetchone()
         limit = PLAN_LIMITS.get(u['plan'] or '', 0)
-        if limit == 0 and user.get('in_trial'):
-            limit = 1  # Trial gets 1 free download
         used  = u['downloads_used'] or 0
         left  = limit - used
         pack_credits = _get_pack_credits(c, user['id'])
@@ -727,11 +790,21 @@ def send_welcome_email(to_email, name, plan):
     Consulta RPP Chihuahua · Si tienes dudas responde a este correo.
   </p>
 </div>"""
-    msg = MIMEMultipart('alternative')
+    msg = MIMEMultipart('mixed')
     msg['Subject'] = subject
     msg['From']    = frm
     msg['To']      = to_email
     msg.attach(MIMEText(body_html, 'html'))
+    # Attach plan guide PDF
+    _plan_key = plan if plan in ('basico','pro','empresarial','corporativo') else 'corporativo'
+    _guide_path = os.path.join(os.path.dirname(DB_PATH), 'guides', f'guia_plan_{_plan_key}.pdf')
+    if os.path.exists(_guide_path):
+        from email.mime.application import MIMEApplication
+        with open(_guide_path, 'rb') as _f:
+            _pdf = MIMEApplication(_f.read(), _subtype='pdf')
+            _pdf.add_header('Content-Disposition', 'attachment',
+                            filename=f'Guia_Consulta_RPP_Plan_{plan_label}.pdf')
+            msg.attach(_pdf)
     try:
         ctx = ssl.create_default_context()
         if port == 465:
@@ -774,7 +847,7 @@ def send_receipt_email(to_email, name, folio, amount=130):
     <tr><td style="color:#666;padding:.4rem 0;border-bottom:1px solid #1e1e2e">Monto</td>
         <td style="color:#4ade80;font-weight:600;text-align:right">${amount} MXN</td></tr>
     <tr><td style="color:#666;padding:.4rem 0">Fecha</td>
-        <td style="color:#dde0e8;font-weight:600;text-align:right">{datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC</td></tr>
+        <td style="color:#dde0e8;font-weight:600;text-align:right">{_now().strftime('%d/%m/%Y %H:%M')} UTC</td></tr>
   </table>
   <a href="https://consulta-rpp.javisnes.com" style="display:block;margin-top:1.5rem;text-align:center;
      background:linear-gradient(135deg,#8b9cf4,#c084fc);color:#fff;padding:.7rem 1.5rem;
@@ -829,7 +902,7 @@ def send_pack_email(to_email, name, pack_type, credits):
     <tr><td style="color:#666;padding:.4rem 0;border-bottom:1px solid #1e1e2e">Monto</td>
         <td style="color:#4ade80;font-weight:600;text-align:right">${price} MXN</td></tr>
     <tr><td style="color:#666;padding:.4rem 0">Fecha</td>
-        <td style="color:#dde0e8;font-weight:600;text-align:right">{datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC</td></tr>
+        <td style="color:#dde0e8;font-weight:600;text-align:right">{_now().strftime('%d/%m/%Y %H:%M')} UTC</td></tr>
   </table>
   <p style="color:#aaa;font-size:.875rem;margin-top:1rem">Las descargas no expiran. Úsalas cuando quieras.</p>
   <a href="https://consulta-rpp.javisnes.com" style="display:block;margin-top:1.5rem;text-align:center;
@@ -893,9 +966,84 @@ _EMAIL_BTN  = ('display:block;margin-top:1.5rem;text-align:center;'
                'background:linear-gradient(135deg,#8b9cf4,#c084fc);color:#fff;'
                'padding:.7rem 1.5rem;border-radius:8px;text-decoration:none;font-weight:600')
 
+def send_conversion_email(to_email, name, purchase_count, total_spent):
+    """Email de conversión tras 2ª+ compra individual — invita a suscribirse."""
+    subject = f'¿Ya viste cuánto has gastado en escrituras? — Consulta RPP'
+    savings = total_spent - 500
+    body = f"""
+<div style="font-family:sans-serif;max-width:520px;margin:auto;background:#0d0d14;color:#dde0e8;padding:2rem;border-radius:12px">
+  <h2 style="margin:0 0 .25rem;background:linear-gradient(120deg,#facc15,#f97316);
+             -webkit-background-clip:text;-webkit-text-fill-color:transparent">
+    Hola {name or 'ahí'} 👋
+  </h2>
+  <p style="color:#aaa;margin:.5rem 0 1.5rem;font-size:.9rem">
+    Llevas <strong style="color:#facc15">{purchase_count} escrituras</strong> descargadas
+    ({total_spent} MXN en total). Con el Plan Básico ya te hubiera salido más barato.
+  </p>
+  <table style="width:100%;border-collapse:collapse;font-size:.875rem;margin-bottom:1.5rem">
+    <tr style="border-bottom:1px solid #1e1e2e">
+      <td style="color:#666;padding:.5rem 0">Lo que pagaste</td>
+      <td style="color:#f87171;font-weight:700;text-align:right">${total_spent} MXN</td>
+    </tr>
+    <tr style="border-bottom:1px solid #1e1e2e">
+      <td style="color:#666;padding:.5rem 0">Plan Básico / mes</td>
+      <td style="color:#4ade80;font-weight:700;text-align:right">$500 MXN</td>
+    </tr>
+    <tr>
+      <td style="color:#666;padding:.5rem 0">Incluye</td>
+      <td style="color:#dde0e8;font-weight:600;text-align:right">5 descargas + búsqueda por nombre</td>
+    </tr>
+  </table>
+  <p style="color:#aaa;font-size:.85rem;margin-bottom:1.25rem">
+    Con una suscripción también puedes buscar por <strong style="color:#c084fc">nombre del propietario</strong>,
+    ver historial de descargas y re-descargar tus escrituras sin costo adicional.
+  </p>
+  <a href="https://consulta-rpp.javisnes.com/pricing"
+     style="display:block;text-align:center;background:linear-gradient(135deg,#facc15,#f97316);
+            color:#000;padding:.75rem 1.5rem;border-radius:8px;text-decoration:none;
+            font-weight:700;font-size:.95rem">
+    Ver planes desde $500/mes →
+  </a>
+  <p style="color:#333;font-size:.75rem;margin-top:1.5rem;text-align:center">
+    Consulta RPP Chihuahua · Puedes cancelar cuando quieras.
+  </p>
+</div>"""
+    threading.Thread(target=_smtp_send, args=(to_email, subject, body), daemon=True).start()
+
+def _notify_admin_payment(user_name, user_email, tipo, detalle, monto):
+    """Notifica al admin cuando se recibe un pago."""
+    now_str = _now().strftime('%Y-%m-%d %H:%M UTC')
+    emojis  = {'single': '📄', 'pack5': '📦', 'pack10': '📦', 'extra': '⭐', 'sub': '🔄'}
+    emoji   = emojis.get(tipo, '💳')
+    subject = f'{emoji} Nuevo pago — {user_name} ({tipo.upper()}) ${monto} MXN'
+    row = lambda lbl, val, color='#dde0e8': (
+        f'<tr style="border-bottom:1px solid #1e1e2e">'
+        f'<td style="padding:.55rem .75rem;color:#666;width:38%;font-size:.85rem">{lbl}</td>'
+        f'<td style="padding:.55rem .75rem;color:{color};font-size:.875rem"><strong>{val}</strong></td></tr>'
+    )
+    body = f"""
+    <div style="{_EMAIL_WRAP}">
+      <h2 style="margin:0 0 .25rem;background:linear-gradient(120deg,#4ade80,#22d3ee);
+                 -webkit-background-clip:text;-webkit-text-fill-color:transparent">
+        {emoji} Nuevo pago recibido
+      </h2>
+      <p style="color:#555;font-size:.8rem;margin-bottom:1.5rem">{now_str}</p>
+      <table style="width:100%;border-collapse:collapse">
+        {row('Usuario', user_name)}
+        {row('Email', user_email, '#8b9cf4')}
+        {row('Tipo', tipo.upper(), '#facc15')}
+        {row('Detalle', detalle, '#c084fc')}
+        {row('Monto', f'${monto} MXN', '#4ade80')}
+      </table>
+      <a href="https://consulta-rpp.javisnes.com/admin" style="{_EMAIL_BTN}">
+        Ver en Admin Panel →
+      </a>
+    </div>"""
+    threading.Thread(target=_smtp_send, args=(ADMIN_EMAIL, subject, body), daemon=True).start()
+
 def _notify_new_user(name, email, uid, method, ip='', ref_code=''):
     """Send admin notification email when a new user registers."""
-    now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    now_str = _now().strftime('%Y-%m-%d %H:%M UTC')
     subject = f'🆕 Nuevo usuario — {name} ({email})'
     row = lambda lbl, val, color='#dde0e8': (
         f'<tr style="border-bottom:1px solid #1e1e2e">'
@@ -1007,7 +1155,7 @@ def check_folio_alerts():
 
 def send_renewal_reminders():
     """Email users 3 days before their plan renews. Called daily by cron."""
-    now          = datetime.utcnow()
+    now          = _now()
     window_start = (now - timedelta(days=27)).isoformat()
     window_end   = (now - timedelta(days=26)).isoformat()
     sent = 0
@@ -1031,7 +1179,7 @@ def send_renewal_reminders():
 
 def send_trial_expiry_reminders():
     """Email trial users 2 days before trial ends. Called daily by cron."""
-    now          = datetime.utcnow()
+    now          = _now()
     window_start = (now + timedelta(days=1)).isoformat()
     window_end   = (now + timedelta(days=3)).isoformat()
     sent = 0
@@ -1052,21 +1200,27 @@ def send_trial_expiry_reminders():
     return sent
 
 
-def record_dl(user_id, folio, use_extra, use_pack=False, nombre=None):
+def record_dl(user_id, folio, use_extra, use_pack=False, nombre=None, redownload=False):
     with _db() as c:
-        if use_pack:
+        if redownload:
+            pass  # Ya pagó por este folio — no consume crédito
+        elif use_pack:
             _use_pack_credit(c, user_id)
         elif use_extra:
             row = c.execute(
-                'SELECT id FROM extra_credits WHERE user_id=? AND used=0 ORDER BY ts LIMIT 1',
+                'SELECT id, payment_intent FROM extra_credits WHERE user_id=? AND used=0 ORDER BY ts LIMIT 1',
                 (user_id,)).fetchone()
             if row:
                 c.execute('UPDATE extra_credits SET used=1 WHERE id=?', (row['id'],))
+                if row[1]:  # payment_intent
+                    c.execute(
+                        'UPDATE single_purchases SET folio_real=? WHERE user_id=? AND payment_intent=? AND (folio_real IS NULL OR folio_real="")',
+                        (str(folio), user_id, row[1]))
         else:
             c.execute('UPDATE users SET downloads_used=downloads_used+1 WHERE id=?', (user_id,))
             c.execute("""UPDATE users SET period_start=COALESCE(period_start,?)
                          WHERE id=? AND period_start IS NULL""",
-                      (datetime.utcnow().isoformat(), user_id))
+                      (_now().isoformat(), user_id))
         c.execute('INSERT INTO downloads(user_id,folio_real,nombre) VALUES(?,?,?)',
                   (user_id, str(folio), nombre or None))
 
@@ -1102,21 +1256,24 @@ def render_dashboard(u, dl, history, monthly_counts, annual_used, annual_quota, 
           <td style="text-align:right;color:#dde0e8;font-weight:600;width:2.5rem">{cnt}</td>
         </tr>'''
 
-    # History rows
+    # History rows — detect if team column is needed
+    has_team = MAX_TEAM_MEMBERS.get(u.get('plan') or '', 0) > 0
     hist_rows = ''
     for r in history:
-        ts = (r.get('ts') or '')
+        ts    = (r.get('ts') or '')
         fecha = ts[:10] if ts else '—'
         hora  = ts[11:16] if len(ts) > 11 else '—'
         folio = r.get('folio_real') or '—'
         nom   = r.get('nombre') or '—'
-        hist_rows += f'<tr><td style="color:#555;font-size:.77rem">{fecha}</td><td style="color:#555;font-size:.77rem">{hora}</td><td style="color:#8b9cf4;font-family:monospace">{folio}</td><td style="color:#aaa;font-size:.82rem">{nom}</td></tr>'
+        quien = r.get('quien') or '—'
+        team_td = f'<td style="color:#8b9cf4;font-size:.77rem">{quien}</td>' if has_team else ''
+        hist_rows += f'<tr><td style="color:#555;font-size:.77rem">{fecha}</td><td style="color:#555;font-size:.77rem">{hora}</td><td style="color:#8b9cf4;font-family:monospace">{folio}</td><td style="color:#aaa;font-size:.82rem">{nom}</td>{team_td}</tr>'
+    colspan = 5 if has_team else 4
     if not hist_rows:
-        hist_rows = '<tr><td colspan="4" style="color:#333;text-align:center;padding:1.5rem">Sin descargas en el periodo seleccionado</td></tr>'
+        hist_rows = f'<tr><td colspan="{colspan}" style="color:#333;text-align:center;padding:1.5rem">Sin descargas en el periodo seleccionado</td></tr>'
 
     # Year options
-    import datetime as _dt
-    cur_year = _dt.datetime.utcnow().year
+    cur_year = _now().year
     year_opts = ''.join(f'<option value="{y}" {"selected" if y==selected_year else ""}>{y}</option>'
                         for y in range(cur_year - 2, cur_year + 1))
     month_opts = '<option value="0" ' + ('selected' if selected_month==0 else '') + '>Todos los meses</option>'
@@ -1238,7 +1395,7 @@ def render_dashboard(u, dl, history, monthly_counts, annual_used, annual_quota, 
       </div>
     </div>
     <table>
-      <thead><tr><th>Fecha</th><th>Hora</th><th>Folio Real</th><th>Propietario</th></tr></thead>
+      <thead><tr><th>Fecha</th><th>Hora</th><th>Folio Real</th><th>Propietario</th>{'<th>Usuario</th>' if has_team else ''}</tr></thead>
       <tbody>{hist_rows}</tbody>
     </table>
   </div>
@@ -1329,12 +1486,41 @@ LOGIN_HTML = """<!DOCTYPE html>
     <div class="form-group">
       <label>Correo electrónico</label>
       <input type="email" id="inp-email" placeholder="correo@ejemplo.com" autocomplete="email"
-             onkeydown="if(event.key==='Enter')sendMagicLink()">
+             onkeydown="if(event.key==='Enter')sendMagicLink()"
+             oninput="document.getElementById('magic-err').style.display='none'">
+      <div id="email-warning" style="display:none;font-size:.72rem;color:#f59e0b;margin-top:.3rem">
+        ⚠️ Verifica que tu correo esté bien escrito antes de continuar.
+      </div>
     </div>
     <button class="btn-main" id="btn-magic" onclick="sendMagicLink()">
       ✉ Enviar link de acceso
     </button>
     <div class="err" id="magic-err"></div>
+    <div style="margin-top:.85rem;padding:.65rem .85rem;background:#0f1120;border:1px solid #1e2340;border-radius:8px;font-size:.78rem;color:#6b7280;line-height:1.55">
+      💡 <strong style="color:#8b9cf4">¿Cómo funciona el link de acceso?</strong><br>
+      Cada vez que quieras entrar, escribe tu correo y te mandamos un link nuevo. Haz clic en él y quedas dentro — sin necesidad de recordar una contraseña.<br>
+      <span style="color:#4b5563;margin-top:.35rem;display:block">¿Ya tienes contraseña? <a href="#" onclick="togglePwForm();return false" style="color:#8b9cf4;text-decoration:none">Entra con contraseña</a></span>
+    </div>
+  </div>
+
+  <!-- Password login form (hidden by default) -->
+  <div id="pw-form" style="display:none;margin-top:1rem">
+    <div class="form-group">
+      <label>Correo electrónico</label>
+      <input type="email" id="pw-email" placeholder="correo@ejemplo.com" autocomplete="email">
+    </div>
+    <div class="form-group">
+      <label>Contraseña</label>
+      <input type="password" id="pw-pass" placeholder="Tu contraseña" autocomplete="current-password"
+             onkeydown="if(event.key==='Enter')loginConPassword()">
+    </div>
+    <button class="btn-main" onclick="loginConPassword()">🔑 Iniciar sesión</button>
+    <div class="err" id="pw-err"></div>
+    <p style="text-align:center;margin-top:.6rem;font-size:.78rem">
+      <a href="/forgot-password" style="color:#6b7280;text-decoration:none">Olvidé mi contraseña</a>
+      &nbsp;·&nbsp;
+      <a href="#" onclick="togglePwForm();return false" style="color:#6b7280;text-decoration:none">Usar link de acceso</a>
+    </p>
   </div>
 
   <!-- Success state -->
@@ -1349,6 +1535,56 @@ LOGIN_HTML = """<!DOCTYPE html>
   <p class="note">Al continuar aceptas los <a href="/terminos" style="color:#444;text-decoration:underline">términos de uso</a>.</p>
 </div>
 <script>
+function togglePwForm(){
+  const pf = document.getElementById('pw-form');
+  const mf = document.getElementById('magic-form');
+  const show = pf.style.display === 'none';
+  pf.style.display = show ? '' : 'none';
+  mf.style.display = show ? 'none' : '';
+  if (show) document.getElementById('pw-email').focus();
+}
+async function loginConPassword(){
+  const btn = document.querySelector('#pw-form .btn-main');
+  const err = document.getElementById('pw-err');
+  err.style.display = 'none';
+  const email = document.getElementById('pw-email').value.trim();
+  const pass  = document.getElementById('pw-pass').value;
+  if (!email || !pass) { err.textContent='Ingresa tu correo y contraseña'; err.style.display=''; return; }
+  btn.disabled = true; btn.textContent = 'Entrando...';
+  try {
+    const res = await fetch('/login/email', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({email, password: pass})
+    });
+    const d = await res.json();
+    if (res.ok) { window.location.href = '/'; return; }
+    err.textContent = d.error || 'Correo o contraseña incorrectos';
+    err.style.display = '';
+  } catch(e) {
+    err.textContent = 'Error de conexión. Intenta de nuevo.';
+    err.style.display = '';
+  }
+  btn.disabled = false; btn.textContent = '🔑 Iniciar sesión';
+}
+// Warn on common typo domains
+document.addEventListener('DOMContentLoaded', function() {{
+  const inp = document.getElementById('inp-email');
+  if (!inp) return;
+  const knownDomains = ['gmail.com','hotmail.com','yahoo.com','outlook.com','icloud.com','live.com','msn.com'];
+  inp.addEventListener('blur', function() {{
+    const val = inp.value.trim().toLowerCase();
+    if (!val.includes('@')) return;
+    const domain = val.split('@')[1] || '';
+    const warn = document.getElementById('email-warning');
+    // Check for obvious typos: missing dot, common misspellings
+    const suspicious = domain && !knownDomains.includes(domain) &&
+      (knownDomains.some(d => d.replace('.','').includes(domain.replace('.','').slice(0,6)) && domain !== d)
+       || /^(gmai|gmial|hotmal|hotmial|yahooo|outlok|outlookk|hormail|jhotmail)/.test(domain));
+    if (warn) warn.style.display = suspicious ? '' : 'none';
+  }});
+}});
+
 async function sendMagicLink(){
   const btn = document.getElementById('btn-magic');
   const err = document.getElementById('magic-err');
@@ -1536,21 +1772,43 @@ def render_pricing(user=None):
 
     extra_section = f"""
     <div class="extra-box">
-      <div class="extra-title">Paquetes de descargas</div>
-      <p class="extra-desc">Compra un paquete y úsalas cuando quieras. No expiran.</p>
-      <div style="display:flex;gap:.8rem;justify-content:center;flex-wrap:wrap;margin-bottom:.8rem">
-        <button class="plan-btn" style="background:linear-gradient(135deg,#4ade80,#22c55e);width:auto;padding:.6rem 1.4rem;position:relative"
-                onclick="buyPack('pack5')">5 descargas — $500 MXN
-          <span style="position:absolute;top:-8px;right:-8px;background:#f472b6;color:#fff;font-size:.6rem;padding:.15rem .4rem;border-radius:10px;font-weight:700">Ahorra $150</span>
-        </button>
-        <button class="plan-btn" style="background:linear-gradient(135deg,#8b9cf4,#c084fc);width:auto;padding:.6rem 1.4rem;position:relative"
-                onclick="buyPack('pack10')">10 descargas — $900 MXN
-          <span style="position:absolute;top:-8px;right:-8px;background:#f472b6;color:#fff;font-size:.6rem;padding:.15rem .4rem;border-radius:10px;font-weight:700">Ahorra $400</span>
-        </button>
+      <div class="extra-title">Sin suscripción — paga por lo que usas</div>
+      <p class="extra-desc" style="margin-bottom:1rem">Créditos de descarga que no expiran. Úsalos cuando quieras.</p>
+      <div style="display:flex;gap:.9rem;justify-content:center;flex-wrap:wrap;align-items:stretch">
+
+        <!-- 1 escritura -->
+        <div style="background:#1a1226;border:1.5px solid #f59e0b55;border-radius:12px;padding:1rem 1.2rem;min-width:160px;max-width:200px;text-align:center;flex:1;display:flex;flex-direction:column;gap:.5rem">
+          <div style="font-size:1.5rem">📄</div>
+          <div style="font-weight:700;color:#f5f5f5;font-size:1rem">1 escritura</div>
+          <div style="font-size:1.5rem;font-weight:800;color:#f59e0b">$130 <span style="font-size:.75rem;font-weight:400;color:#888">MXN</span></div>
+          <div style="font-size:.75rem;color:#888;flex:1">Ideal si solo necesitas una consulta</div>
+          <button class="plan-btn" style="background:linear-gradient(135deg,#f59e0b,#f97316);width:100%;padding:.55rem .5rem;font-size:.85rem;margin-top:.3rem"
+                  onclick="buyExtra(this)">Comprar</button>
+        </div>
+
+        <!-- Pack 5 -->
+        <div style="background:#112318;border:1.5px solid #4ade8055;border-radius:12px;padding:1rem 1.2rem;min-width:160px;max-width:200px;text-align:center;flex:1;display:flex;flex-direction:column;gap:.5rem;position:relative">
+          <div style="font-size:1.5rem">📦</div>
+          <div style="font-weight:700;color:#f5f5f5;font-size:1rem">5 escrituras</div>
+          <div style="font-size:1.5rem;font-weight:800;color:#4ade80">$500 <span style="font-size:.75rem;font-weight:400;color:#888">MXN</span></div>
+          <div style="font-size:.75rem;color:#888;flex:1">$100 c/u · Ahorra $150 vs individual</div>
+          <button class="plan-btn" style="background:linear-gradient(135deg,#4ade80,#22c55e);width:100%;padding:.55rem .5rem;font-size:.85rem;margin-top:.3rem;color:#0a2e14"
+                  onclick="buyPack('pack5')">Comprar pack</button>
+          <span style="position:absolute;top:-9px;right:10px;background:#f472b6;color:#fff;font-size:.6rem;padding:.15rem .5rem;border-radius:10px;font-weight:700">Ahorra $150</span>
+        </div>
+
+        <!-- Pack 10 -->
+        <div style="background:#0f1526;border:1.5px solid #8b9cf455;border-radius:12px;padding:1rem 1.2rem;min-width:160px;max-width:200px;text-align:center;flex:1;display:flex;flex-direction:column;gap:.5rem;position:relative">
+          <div style="font-size:1.5rem">🗂️</div>
+          <div style="font-weight:700;color:#f5f5f5;font-size:1rem">10 escrituras</div>
+          <div style="font-size:1.5rem;font-weight:800;color:#8b9cf4">$900 <span style="font-size:.75rem;font-weight:400;color:#888">MXN</span></div>
+          <div style="font-size:.75rem;color:#888;flex:1">$90 c/u · El mejor precio por crédito</div>
+          <button class="plan-btn" style="background:linear-gradient(135deg,#8b9cf4,#c084fc);width:100%;padding:.55rem .5rem;font-size:.85rem;margin-top:.3rem"
+                  onclick="buyPack('pack10')">Comprar pack</button>
+          <span style="position:absolute;top:-9px;right:10px;background:#f472b6;color:#fff;font-size:.6rem;padding:.15rem .5rem;border-radius:10px;font-weight:700">Ahorra $400</span>
+        </div>
+
       </div>
-      <p class="extra-desc" style="margin-top:.5rem">O compra una sola: <strong style="color:#c084fc">$130 MXN</strong></p>
-      <button class="plan-btn" style="background:#555;width:auto;padding:.5rem 1.2rem;font-size:.875rem"
-              onclick="buyExtra()">&#43; 1 descarga — $130 MXN</button>
     </div>"""
 
     pub_key  = STRIPE_PUB_KEY
@@ -1751,18 +2009,19 @@ async function buyPack(pack) {{
   }} catch(e) {{ window.location = '/login'; }}
 }}
 
-async function buyExtra() {{
+async function buyExtra(btn) {{
   if (!PUB_KEY) {{ showToast('Stripe no configurado aún'); return; }}
   if (!USER.plan || USER.sub_status !== 'active') {{
     showToast('Necesitas una suscripción activa para comprar descargas extra');
     return;
   }}
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Procesando...'; }}
   try {{
     const res = await fetch('/create-checkout/extra', {{method:'POST',headers:{{'Content-Type':'application/json'}}}});
     const d   = await res.json();
     if (d.url) {{ window.location = d.url; }}
-    else       {{ showToast(d.error || 'Error al crear sesión de pago'); }}
-  }} catch(e) {{ showToast('Error de red'); }}
+    else       {{ if (btn) {{ btn.disabled = false; btn.textContent = '+ 1 descarga — $130 MXN'; }} showToast(d.error || 'Error al crear sesión de pago'); }}
+  }} catch(e) {{ if (btn) {{ btn.disabled = false; btn.textContent = '+ 1 descarga — $130 MXN'; }} showToast('Error de red'); }}
 }}
 
 function showToast(msg) {{
@@ -1836,10 +2095,17 @@ def render_admin(users_rows, metrics=None):
     canceled         = m.get('canceled', 0)
     conversion       = m.get('conversion_rate', 0)
     onetime_rev      = m.get('onetime_rev_month', 0)
-    total_revenue    = m.get('total_revenue', 0)
-    # downloads per day chart (last 14 days)
-    dl_chart_data = json.dumps(m.get('dl_per_day', []))
-    churn_list    = json.dumps(m.get('churn_alerts', []))
+    real_revenue     = m.get('real_revenue', 0)
+    stripe_ok        = m.get('stripe_ok', False)
+    active_7d        = m.get('active_7d', 0)
+    trials_list      = m.get('trials_list', [])
+    # charts data
+    dl_chart_data    = json.dumps(m.get('dl_per_day', []))
+    reg_chart_data   = json.dumps(m.get('reg_per_day', []))
+    churn_list       = json.dumps(m.get('churn_alerts', []))
+    trials_json      = json.dumps(trials_list)
+    revenue_label    = f'${real_revenue:,} MXN' + (' ✓' if stripe_ok else ' (est.)')
+    revenue_color    = '#4ade80' if stripe_ok else '#f59e0b'
 
     return f"""<!DOCTYPE html>
 <html lang="es"><head>
@@ -1972,12 +2238,12 @@ def render_admin(users_rows, metrics=None):
   <div class="metrics">
     <div class="mcard"><div class="mval">{total_users}</div><div class="mlbl">Usuarios</div></div>
     <div class="mcard"><div class="mval" style="color:#4ade80">{active_subs}</div><div class="mlbl">Suscripciones</div></div>
+    <div class="mcard"><div class="mval" style="color:#8b9cf4">{active_7d}</div><div class="mlbl">Activos 7d</div></div>
     <div class="mcard"><div class="mval" style="color:#c084fc">{dl_month}</div><div class="mlbl">Desc. este mes</div></div>
-    <div class="mcard"><div class="mval" style="color:#8b9cf4">{total_dl}</div><div class="mlbl">Desc. totales</div></div>
     <div class="mcard"><div class="mval" style="color:#f59e0b">${mrr_estimate:,}</div><div class="mlbl">MRR estimado</div></div>
     <div class="mcard"><div class="mval" style="color:#34d399">${onetime_rev:,}</div><div class="mlbl">Compras únicas (mes)</div></div>
-    <div class="mcard" style="border-color:#6366f1"><div class="mval" style="color:#a5b4fc">${total_revenue:,}</div><div class="mlbl">Ingresos totales</div></div>
-    <div class="mcard"><div class="mval" style="color:#facc15">{trial_users}</div><div class="mlbl">En trial</div></div>
+    <div class="mcard" style="border-color:#6366f1"><div class="mval" style="color:{revenue_color}">{revenue_label}</div><div class="mlbl">Ingresos totales</div></div>
+    <div class="mcard"><div class="mval" style="color:#facc15">{trial_users}</div><div class="mlbl">En trial <span style="font-size:.6rem;cursor:pointer;color:#6366f1" onclick="switchTabByName('trials')">ver →</span></div></div>
     <div class="mcard"><div class="mval" style="color:#f472b6">{conversion:.0f}%</div><div class="mlbl">Conversion</div></div>
     <div class="mcard"><div class="mval" style="color:#f87171">{canceled}</div><div class="mlbl">Cancelados</div></div>
   </div>
@@ -1987,6 +2253,7 @@ def render_admin(users_rows, metrics=None):
     <button class="tab active" onclick="switchTab('usuarios')">Usuarios</button>
     <button class="tab" onclick="switchTab('actividad')">Actividad</button>
     <button class="tab" onclick="switchTab('descargas')">Descargas</button>
+    <button class="tab" onclick="switchTab('trials')" style="color:#facc15">⏳ Trials</button>
     <button class="tab" onclick="switchTab('churn')">Alertas</button>
     <button class="tab" onclick="switchTab('realtime')">Tiempo Real</button>
     <button class="tab" onclick="switchTab('ia')" style="background:linear-gradient(135deg,#8b9cf422,#c084fc22);border-color:#8b9cf455;color:#c084fc">🤖 IA</button>
@@ -2032,13 +2299,32 @@ def render_admin(users_rows, metrics=None):
 
   <!-- TAB: DESCARGAS -->
   <div class="tab-content" id="tab-descargas">
-    <h3 style="font-size:.9rem;color:#888;margin-bottom:.5rem">Descargas por dia (ultimos 14 dias)</h3>
-    <div class="chart" id="dl-chart"></div>
-    <div class="chart-labels" id="dl-chart-labels"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
+      <div>
+        <h3 style="font-size:.9rem;color:#888;margin-bottom:.5rem">Descargas por dia (ultimos 14 dias)</h3>
+        <div class="chart" id="dl-chart"></div>
+        <div class="chart-labels" id="dl-chart-labels"></div>
+      </div>
+      <div>
+        <h3 style="font-size:.9rem;color:#888;margin-bottom:.5rem">Registros por dia (ultimos 14 dias)</h3>
+        <div class="chart" id="reg-chart"></div>
+        <div class="chart-labels" id="reg-chart-labels"></div>
+      </div>
+    </div>
     <div style="margin-top:1rem">
       <h3 style="font-size:.9rem;color:#888;margin-bottom:.5rem">Descargas por usuario (este mes)</h3>
       <div id="user-dl-ranking"></div>
     </div>
+  </div>
+
+  <!-- TAB: TRIALS -->
+  <div class="tab-content" id="tab-trials">
+    <div style="display:flex;align-items:center;gap:1rem;margin-bottom:.8rem">
+      <h3 style="font-size:.9rem;color:#888">Usuarios en trial activo — oportunidad de conversión</h3>
+      <button class="abtn orange" onclick="sendFollowups(this)">📧 Enviar follow-up ahora</button>
+      <span id="followup-msg" style="font-size:.75rem;color:#aaa"></span>
+    </div>
+    <div id="trials-list"></div>
   </div>
 
   <!-- TAB: CHURN ALERTS -->
@@ -2192,7 +2478,9 @@ def render_admin(users_rows, metrics=None):
 
   <script>
   const DL_CHART = {dl_chart_data};
+  const REG_CHART = {reg_chart_data};
   const CHURN = {churn_list};
+  const TRIALS = {trials_json};
 
   /* === TABS === */
   function switchTab(name) {{
@@ -2202,9 +2490,19 @@ def render_admin(users_rows, metrics=None):
     event.target.classList.add('active');
     if (name === 'actividad') loadActivity();
     if (name === 'descargas') renderChart();
+    if (name === 'trials') renderTrials();
     if (name === 'churn') renderChurn();
     if (name === 'realtime') loadRealtime();
     if (name === 'ia') loadIACharts();
+  }}
+  function switchTabByName(name) {{
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.add('active');
+    document.querySelectorAll('.tab').forEach(t => {{
+      if (t.getAttribute('onclick') && t.getAttribute('onclick').includes("'" + name + "'")) t.classList.add('active');
+    }});
+    if (name === 'trials') renderTrials();
   }}
 
   /* === SEARCH / FILTER === */
@@ -2245,16 +2543,21 @@ def render_admin(users_rows, metrics=None):
   }}
 
   /* === CHART === */
-  function renderChart() {{
-    const chart = document.getElementById('dl-chart');
-    const labels = document.getElementById('dl-chart-labels');
-    if (!DL_CHART.length) {{ chart.innerHTML = '<span style="color:#555">Sin datos</span>'; return; }}
-    const max = Math.max(...DL_CHART.map(d => d.count), 1);
-    chart.innerHTML = DL_CHART.map(d => {{
+  function _renderBarChart(dataArr, chartId, labelsId, color) {{
+    const chart = document.getElementById(chartId);
+    const labels = document.getElementById(labelsId);
+    if (!dataArr || !dataArr.length) {{ chart.innerHTML = '<span style="color:#555">Sin datos</span>'; return; }}
+    const max = Math.max(...dataArr.map(d => d.count), 1);
+    chart.innerHTML = dataArr.map(d => {{
       const h = Math.max((d.count / max) * 100, 2);
-      return '<div class="chart-bar" style="height:' + h + '%"><div class="tip">' + d.date.slice(5) + ': ' + d.count + '</div></div>';
+      const c = color || 'linear-gradient(to top,#8b9cf4,#c084fc)';
+      return '<div class="chart-bar" style="height:' + h + '%;background:' + c + '"><div class="tip">' + d.date.slice(5) + ': ' + d.count + '</div></div>';
     }}).join('');
-    labels.innerHTML = DL_CHART.map(d => '<span>' + d.date.slice(8) + '</span>').join('');
+    labels.innerHTML = dataArr.map(d => '<span>' + d.date.slice(8) + '</span>').join('');
+  }}
+  function renderChart() {{
+    _renderBarChart(DL_CHART, 'dl-chart', 'dl-chart-labels', 'linear-gradient(to top,#8b9cf4,#c084fc)');
+    _renderBarChart(REG_CHART, 'reg-chart', 'reg-chart-labels', 'linear-gradient(to top,#4ade80,#22d3ee)');
     // User ranking
     fetch('/admin/user-dl-ranking').then(r=>r.json()).then(data => {{
       const el = document.getElementById('user-dl-ranking');
@@ -2263,6 +2566,51 @@ def render_admin(users_rows, metrics=None):
         + data.map(u => '<tr><td>' + (u.name||'') + '</td><td style="color:#aaa;font-size:.75rem">' + u.email + '</td><td style="color:#c084fc;font-weight:700;text-align:center">' + u.count + '</td></tr>').join('')
         + '</tbody></table>';
     }});
+  }}
+
+  /* === TRIALS === */
+  function openTrialGrant(btn) {{
+    openGrantModal(+btn.dataset.uid, btn.dataset.uname, '', '', 'month');
+  }}
+  function renderTrials() {{
+    const el = document.getElementById('trials-list');
+    if (!TRIALS.length) {{
+      el.innerHTML = '<p style="color:#555;font-size:.875rem">No hay usuarios en trial activo.</p>';
+      return;
+    }}
+    let html = '<table><thead><tr><th>Usuario</th><th>Email</th><th style="color:#facc15">D&iacute;as</th><th>Vence</th><th></th></tr></thead><tbody>';
+    TRIALS.forEach(function(t) {{
+      const urgency = t.days_left <= 1 ? '#f87171' : t.days_left <= 2 ? '#f59e0b' : '#facc15';
+      const safeName = (t.name || '').replace(/"/g, '&quot;');
+      html += '<tr>';
+      html += '<td style="cursor:pointer;color:#8b9cf4" onclick="openDetail(' + t.id + ')">' + (t.name || '') + '</td>';
+      html += '<td style="font-size:.75rem;color:#aaa">' + t.email + '</td>';
+      html += '<td style="color:' + urgency + ';font-weight:700;text-align:center">' + t.days_left + 'd</td>';
+      html += '<td style="font-size:.75rem;color:#555">' + t.trial_ends + '</td>';
+      html += '<td><button class="plan-btn-sm" data-uid="' + t.id + '" data-uname="' + safeName + '" onclick="openTrialGrant(this)">Plan</button></td>';
+      html += '</tr>';
+    }});
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  }}
+
+  async function sendFollowups(btn) {{
+    btn.disabled = true; btn.textContent = 'Enviando...';
+    const msg = document.getElementById('followup-msg');
+    try {{
+      const r = await fetch('/admin/send-no-plan-followups', {{
+        method:'POST', credentials:'same-origin',
+        headers:{{'Content-Type':'application/json'}},
+        body: JSON.stringify({{force: true}})
+      }});
+      const d = await r.json();
+      msg.textContent = 'Enviados: ' + d.sent + ' email(s)';
+      msg.style.color = d.sent > 0 ? '#4ade80' : '#f59e0b';
+    }} catch(e) {{
+      msg.textContent = 'Error: ' + e.message;
+      msg.style.color = '#f87171';
+    }}
+    btn.disabled = false; btn.textContent = '📧 Enviar follow-up ahora';
   }}
 
   /* === ACTIVITY LOG === */
@@ -2623,6 +2971,7 @@ def render_admin(users_rows, metrics=None):
       html += '<div class="detail-row"><span class="lbl">Trial hasta</span><span class="val">' + (d.trial_ends||'-').slice(0,10) + '</span></div>';
       html += '<div class="detail-row"><span class="lbl">Descargas usadas</span><span class="val">' + (d.downloads_used||0) + '</span></div>';
       html += '<div class="detail-row"><span class="lbl">Pack credits</span><span class="val">' + (d.pack_credits||0) + '</span></div>';
+      html += '<div class="detail-row"><span class="lbl">Extra credits</span><span class="val" style="color:' + ((d.extra_credits||0)>0?'#4ade80':'#888') + '">' + (d.extra_credits||0) + '</span></div>';
       html += '</div>';
       // Downloads
       html += '<div class="detail-section"><h4>Ultimas descargas (' + d.downloads.length + ')</h4><div class="detail-list">';
@@ -3320,7 +3669,7 @@ LANDING_HTML = """<!DOCTYPE html>
   <div class="referral-box">
     <div style="font-size:2rem;margin-bottom:.75rem">🎁</div>
     <h2>Invita y gana descargas gratis</h2>
-    <p>Comparte tu link personal con colegas. Cada vez que alguien se registre con tu link,
+    <p>Comparte tu link con colegas. Cuando tu referido se suscriba,
        <strong style="color:#c084fc">ambos reciben 1 descarga gratis</strong> — sin límite de referidos.</p>
     <div class="referral-stats">
       <div>
@@ -3592,34 +3941,54 @@ HTML = """<!DOCTYPE html>
     .dl-btn:hover { opacity: .85; }
 
     #results-container { margin-top: 1.5rem; display: none; }
-    .results-title { font-size: .75rem; color: var(--muted); margin-bottom: .75rem;
-      text-transform: uppercase; letter-spacing: .06em; }
-    .prop-card { background: var(--surface); border: 1px solid var(--border);
-      border-radius: 8px; margin-bottom: .875rem; overflow: hidden; }
-    .prop-card-header { padding: .65rem .875rem; border-bottom: 1px solid var(--border);
-      display: flex; justify-content: space-between; align-items: center; }
-    .prop-person-name { font-weight: 600; color: var(--text); font-size: .9375rem; }
-    .prop-distrito { font-size: .75rem; color: var(--muted); background: var(--bg);
-      padding: .15rem .55rem; border-radius: 4px; border: 1px solid var(--border); }
-    .prop-table-wrap { overflow-x: auto; }
-    table.prop-table { width: 100%; border-collapse: collapse; font-size: .8125rem; }
-    table.prop-table th { background: var(--bg); color: var(--muted); font-weight: 600;
-      padding: .45rem .75rem; text-align: left;
-      white-space: nowrap; border-bottom: 1px solid var(--border); }
-    table.prop-table td { padding: .5rem .75rem; border-bottom: 1px solid #111118;
-      color: var(--text); vertical-align: middle; }
-    table.prop-table tr:last-child td { border-bottom: none; }
-    table.prop-table tr:hover td { background: #111118; }
-    .folio-badge { background: #1a1a2e; color: var(--accent);
-      padding: .15rem .45rem; border-radius: 4px; font-family: monospace; font-size: .8125rem; }
-    .dl-row-btn { padding: .3rem .75rem; background: var(--accent); color: #fff;
-      border: none; border-radius: 5px; font-size: .75rem; font-weight: 600; cursor: pointer;
+    .results-title { font-size: .72rem; color: var(--muted); margin-bottom: 1rem;
+      text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
+    /* Propietario group */
+    .prop-owner-group { margin-bottom: 1.5rem; }
+    .prop-owner-header { display: flex; align-items: center; gap: .65rem;
+      margin-bottom: .75rem; }
+    .prop-owner-avatar { width: 34px; height: 34px; border-radius: 50%;
+      background: linear-gradient(135deg,#8b9cf4,#c084fc);
+      display: flex; align-items: center; justify-content: center;
+      font-size: .875rem; font-weight: 700; color: #fff; flex-shrink: 0; }
+    .prop-person-name { font-weight: 700; color: var(--text); font-size: .9375rem; }
+    .prop-distrito { font-size: .68rem; color: #8b9cf4; background: #1a1a2e;
+      padding: .18rem .55rem; border-radius: 20px; border: 1px solid #2a2a4e;
+      font-weight: 600; letter-spacing: .03em; }
+    /* Property cards grid */
+    .prop-cards-grid { display: flex; flex-direction: column; gap: .6rem; }
+    .prop-item-card { background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: .85rem 1rem; transition: border-color .15s; }
+    .prop-item-card:hover { border-color: #2e2e4e; }
+    .prop-item-top { display: flex; align-items: flex-start;
+      justify-content: space-between; gap: 1rem; margin-bottom: .65rem; }
+    .prop-item-folio { display: flex; align-items: center; gap: .5rem; }
+    .folio-badge { background: #0f1535; color: var(--accent);
+      padding: .22rem .6rem; border-radius: 6px; font-family: monospace;
+      font-size: .875rem; font-weight: 700; border: 1px solid #2a3a6a; letter-spacing: .02em; }
+    .prop-item-address { font-size: .82rem; color: #aaa; margin-top: .15rem; line-height: 1.4; }
+    .prop-item-actions { display: flex; gap: .4rem; align-items: center; flex-shrink: 0; }
+    .prop-item-meta { display: flex; gap: 1.2rem; flex-wrap: wrap; }
+    .prop-meta-chip { display: flex; flex-direction: column; gap: .1rem; }
+    .prop-meta-label { font-size: .65rem; color: var(--muted); text-transform: uppercase;
+      letter-spacing: .06em; font-weight: 600; }
+    .prop-meta-val { font-size: .8rem; color: #ccc; font-weight: 500; }
+    /* Buttons */
+    .dl-row-btn { padding: .35rem .8rem; background: var(--accent); color: #fff;
+      border: none; border-radius: 7px; font-size: .78rem; font-weight: 700; cursor: pointer;
       white-space: nowrap; transition: opacity .15s; }
     .dl-row-btn:hover { opacity: .85; }
     .dl-row-btn:disabled { opacity: .35; cursor: not-allowed; }
     .dl-row-btn.done { background: var(--ok-bg); color: var(--ok-text); border: 1px solid var(--ok-border); }
     .dl-row-btn.loading-btn { background: #1a1a2e; color: var(--muted); }
+    .prop-icon-btn { background: transparent; border: 1px solid var(--border);
+      border-radius: 7px; padding: .32rem .55rem; font-size: .8rem; cursor: pointer;
+      transition: border-color .15s, background .15s; color: var(--muted); }
+    .prop-icon-btn:hover { border-color: #4a4a6a; background: #1a1a2e; }
     .no-pdf { font-size: .75rem; color: var(--muted); font-style: italic; }
+    /* Extras panel */
+    .prop-extras-panel { margin-top: .65rem; padding-top: .65rem;
+      border-top: 1px solid var(--border); }
 
     /* Quota modal */
     .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7);
@@ -3757,12 +4126,13 @@ HTML = """<!DOCTYPE html>
     body.light .loading { background:#eef0ff; border-color:#c5c9f0; color:#4455bb; }
     body.light .success { background:#e8fff3; border-color:#86efac; color:#166534; }
     body.light .error   { background:#fff1f2; border-color:#fca5a5; color:#9b1c1c; }
-    body.light .prop-card { background:#fff; border-color:#e0e0ee; }
-    body.light .prop-card-header { border-color:#e0e0ee; }
+    body.light .prop-item-card { background:#fff; border-color:#e0e0ee; }
+    body.light .prop-item-card:hover { border-color:#c0c0d8; }
     body.light .prop-person-name { color:#1a1a2a; }
-    body.light .prop-table th { background:#f8f8fc; color:#777; border-color:#e0e0ee; }
-    body.light .prop-table td { border-color:#e8e8f0; color:#333; }
-    body.light .prop-table tr:hover td { background:#f8f8fc; }
+    body.light .prop-meta-val { color:#333; }
+    body.light .prop-icon-btn { border-color:#e0e0ee; color:#888; }
+    body.light .prop-icon-btn:hover { background:#f8f8fc; border-color:#c0c0d8; }
+    body.light .folio-badge { background:#f0f0ff; color:#5b6ef5; border-color:#c8cdf8; }
     body.light .modal { background:#fff; border-color:#e0e0ee; color:#1a1a2a; }
     body.light .modal p { color:#666; }
     body.light .btn-cancel { background:#f0f0f8; color:#666; }
@@ -3833,9 +4203,27 @@ HTML = """<!DOCTYPE html>
   <div id="recent-downloads" style="display:none;margin-bottom:.9rem"></div>
 
   <div class="no-sub-banner" id="no-sub-banner">
-    <div class="nsb-title">Modo gratuito — desbloquea todo con una suscripción</div>
-    <div class="nsb-perks">Busca por <span>nombre de propietario</span> y <span>lote</span> · Descargas ilimitadas · Sin pagar por cada escritura</div>
-    <a href="/pricing" class="nsb-btn">Ver planes desde $500/mes →</a>
+    <div class="nsb-title">Modo sin suscripción</div>
+    <div class="nsb-perks">Descarga una escritura por <span>$130 MXN</span> · o suscríbete para búsquedas por <span>nombre y lote</span> con descargas ilimitadas</div>
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.4rem;justify-content:center">
+      <button class="nsb-btn" id="nsb-buy-one" onclick="buyExtra(this)"
+              style="background:linear-gradient(135deg,#f59e0b,#f97316);border:none;cursor:pointer;flex:1;max-width:220px">
+        💳 Comprar 1 escritura — $130
+      </button>
+      <a href="/pricing" class="nsb-btn" style="flex:1;max-width:220px;text-align:center;background:#2d1f5e">📦 Ver planes desde $500/mes</a>
+    </div>
+  </div>
+
+  <div id="pending-creds-banner" style="display:none;margin:.5rem 0 .9rem;padding:.75rem 1rem;border-radius:10px;border:1px solid #7c3aed;background:rgba(109,40,217,.12);color:#e9d5ff;font-size:.875rem;display:none;align-items:center;gap:.75rem;flex-wrap:wrap">
+    <span style="font-size:1.15rem">📄</span>
+    <div style="flex:1;min-width:180px">
+      <strong id="pending-creds-title" style="color:#c4b5fd">Tienes 1 escritura lista para descargar</strong><br>
+      <span style="color:#a78bfa;font-size:.8rem">Busca el folio que compraste y descárgala ahora</span>
+    </div>
+    <button onclick="switchTab('folio');document.getElementById('folio').focus()"
+      style="background:#7c3aed;color:#fff;border:none;border-radius:6px;padding:.35rem .85rem;font-size:.8rem;cursor:pointer;flex-shrink:0">
+      Buscar folio →
+    </button>
   </div>
 
   <div class="tabs">
@@ -3844,6 +4232,7 @@ HTML = """<!DOCTYPE html>
     <button class="tab-btn" onclick="switchTab('lote')">Lote</button>
     <button class="tab-btn" onclick="switchTab('agua')" style="color:#38bdf8">💧 Agua JMAS</button>
     <button class="tab-btn" onclick="switchTab('predial')" style="color:#34d399">🏠 Predial</button>
+    <button class="tab-btn" onclick="switchTab('sat')" style="color:#a78bfa">🏛 Contribuyente SAT</button>
   </div>
 
   <!-- TAB: Folio Real -->
@@ -3950,6 +4339,16 @@ HTML = """<!DOCTYPE html>
     <div id="predial-result"></div>
   </div>
 
+  <!-- TAB: SAT CURP -->
+  <div class="tab-panel" id="tab-sat">
+    <label>Verifica RFC — SAT</label>
+    <div style="margin-top:1.2rem;background:#1a1a2a;border:1px solid #2a2a4a;border-radius:12px;padding:1.2rem;text-align:center">
+      <div style="font-size:1.8rem;margin-bottom:.5rem">🔧</div>
+      <div style="font-weight:700;color:#a78bfa;margin-bottom:.4rem">Servicio en mantenimiento</div>
+      <div style="font-size:.82rem;color:#555;line-height:1.5">Esta función estará disponible nuevamente en breve.<br>Disculpa los inconvenientes.</div>
+    </div>
+  </div>
+
   <p class="footer">Diseñado por Javisness · <a href="/estado" style="color:inherit;text-decoration:none" id="status-footer-link">● Estado del servicio</a></p>
 </div>
 
@@ -3975,15 +4374,28 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Quota modal -->
+<!-- Quota modal - rich redesign -->
 <div class="modal-overlay" id="quota-modal">
-  <div class="modal">
-    <h3>Límite de descargas alcanzado</h3>
-    <p id="quota-msg">Has usado todas tus descargas del mes.</p>
-    <div class="modal-btns">
-      <button class="btn-primary" onclick="buyExtraAndDownload()">Descarga extra — $130 MXN</button>
-      <button class="btn-primary" style="background:#6366f1" onclick="window.location='/pricing'">Mejorar plan</button>
-      <button class="btn-cancel" onclick="closeQuotaModal()">Cancelar</button>
+  <div class="modal" style="max-width:460px;padding:0;overflow:hidden;border:1px solid #2a2a3a">
+    <div style="background:linear-gradient(135deg,rgba(248,113,113,.1),rgba(15,15,24,.98));padding:1.4rem 1.5rem 1rem;text-align:center;border-bottom:1px solid #1a1a2a">
+      <div style="font-size:2rem;margin-bottom:.3rem">📊</div>
+      <h3 style="color:#f87171;margin:0 0 .35rem;font-size:1.05rem;font-weight:700">Límite de descargas alcanzado</h3>
+      <p id="quota-msg" style="color:#888;font-size:.83rem;margin:0"></p>
+    </div>
+    <div style="padding:1.2rem 1.2rem .8rem">
+      <div onclick="buyExtraAndDownload()" style="display:flex;align-items:center;gap:.75rem;border:1.5px solid #f59e0b;border-radius:12px;padding:.85rem 1rem;margin-bottom:.7rem;cursor:pointer;background:rgba(245,158,11,.04);transition:background .15s" onmouseover="this.style.background='rgba(245,158,11,.1)'" onmouseout="this.style.background='rgba(245,158,11,.04)'">
+        <span style="font-size:1.6rem">⚡</span>
+        <div style="flex:1">
+          <div style="font-weight:700;color:#f59e0b;font-size:.9rem">Descarga extra — $130 MXN</div>
+          <div style="color:#888;font-size:.75rem">Una descarga inmediata sin cambiar tu plan</div>
+        </div>
+        <span style="color:#f59e0b;font-size:1.1rem;font-weight:700">→</span>
+      </div>
+      <div style="border:1.5px solid #1e1e2e;border-radius:12px;padding:.85rem 1rem">
+        <div style="font-size:.72rem;color:#666;margin-bottom:.55rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em">🚀 Cambiar de plan — más descargas</div>
+        <div id="quota-plan-options" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:.45rem"></div>
+      </div>
+      <button class="btn-cancel" onclick="closeQuotaModal()" style="width:100%;margin-top:.7rem;padding:.5rem">No por ahora</button>
     </div>
   </div>
 </div>
@@ -4015,15 +4427,28 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Antecedentes Quota / Upgrade modal -->
+<!-- Antecedentes Quota / Upgrade modal - rich redesign -->
 <div class="modal-overlay" id="anteced-quota-modal">
-  <div class="modal">
-    <h3>Sin créditos de descarga</h3>
-    <p id="anteced-quota-msg">No tienes descargas disponibles este mes.</p>
-    <div class="modal-btns">
-      <button class="btn-primary" onclick="pagarDescargaAnteced()">&#128176; Comprar — $130 MXN</button>
-      <button class="btn-primary" style="background:#6366f1" onclick="window.location='/pricing'">Mejorar plan ↑</button>
-      <button class="btn-cancel" onclick="closeAntecedQuotaModal()">Cancelar</button>
+  <div class="modal" style="max-width:460px;padding:0;overflow:hidden;border:1px solid #2a2a3a">
+    <div style="background:linear-gradient(135deg,rgba(248,113,113,.1),rgba(15,15,24,.98));padding:1.4rem 1.5rem 1rem;text-align:center;border-bottom:1px solid #1a1a2a">
+      <div style="font-size:2rem;margin-bottom:.3rem">📊</div>
+      <h3 style="color:#f87171;margin:0 0 .35rem;font-size:1.05rem;font-weight:700">Sin créditos de descarga</h3>
+      <p id="anteced-quota-msg" style="color:#888;font-size:.83rem;margin:0"></p>
+    </div>
+    <div style="padding:1.2rem 1.2rem .8rem">
+      <div onclick="pagarDescargaAnteced()" style="display:flex;align-items:center;gap:.75rem;border:1.5px solid #f59e0b;border-radius:12px;padding:.85rem 1rem;margin-bottom:.7rem;cursor:pointer;background:rgba(245,158,11,.04);transition:background .15s" onmouseover="this.style.background='rgba(245,158,11,.1)'" onmouseout="this.style.background='rgba(245,158,11,.04)'">
+        <span style="font-size:1.6rem">⚡</span>
+        <div style="flex:1">
+          <div style="font-weight:700;color:#f59e0b;font-size:.9rem">Descarga extra — $130 MXN</div>
+          <div style="color:#888;font-size:.75rem">Una descarga inmediata sin cambiar tu plan</div>
+        </div>
+        <span style="color:#f59e0b;font-size:1.1rem;font-weight:700">→</span>
+      </div>
+      <div style="border:1.5px solid #1e1e2e;border-radius:12px;padding:.85rem 1rem">
+        <div style="font-size:.72rem;color:#666;margin-bottom:.55rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em">🚀 Cambiar de plan — más descargas</div>
+        <div id="anteced-quota-plan-options" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:.45rem"></div>
+      </div>
+      <button class="btn-cancel" onclick="closeAntecedQuotaModal()" style="width:100%;margin-top:.7rem;padding:.5rem">No por ahora</button>
     </div>
   </div>
 </div>
@@ -4069,7 +4494,8 @@ async function loadUserBar() {
     const planLabel = isTeamMember ? 'Equipo' : ({basico:'Básico',pro:'Pro',empresarial:'Empresarial',corporativo:'Corporativo',corporativo_pro:'Corp. Pro'}[u.plan] || '');
     const isAdmin   = u.role === 'admin';
     const inTrial   = u.in_trial || false;
-    const hasSub    = isAdmin || u.sub_status === 'active' || inTrial || isTeamMember;
+    const extraCreds = u.extra_credits || 0;
+    const hasSub    = isAdmin || u.sub_status === 'active' || inTrial || isTeamMember || extraCreds > 0;
     const dlLeft    = u.downloads_left || 0;
     const packCreds = u.pack_credits || 0;
     const dlClass   = isAdmin ? 'dl-ok' : (dlLeft <= 2 && hasSub ? 'dl-low' : 'dl-left');
@@ -4123,6 +4549,10 @@ async function loadUserBar() {
     if (!hasSub) {
       ddHTML += `<a href="/pricing" onclick="closeBarMenu()"><span class="dd-icon">⭐</span>Ver planes</a>`;
     }
+    // Mis escrituras — visible si tiene al menos 1 compra individual
+    if (!isAdmin && (u.single_purchases_count || 0) > 0) {
+      ddHTML += `<a href="/mis-escrituras" onclick="closeBarMenu()"><span class="dd-icon">📄</span>Mis Escrituras<span class="dd-sub">Tus compras · Re-descarga gratis</span></a>`;
+    }
     // Referral promo (all non-admin users)
     if (!isAdmin && u.referral_code) {
       ddHTML += `<div class="dd-sep"></div>`;
@@ -4154,6 +4584,20 @@ async function loadUserBar() {
       banner.style.borderColor = '#f59e0b';
       banner.innerHTML = '⏱️ Trial gratuito — te quedan <strong>' + daysLeft + ' día(s)</strong>. Búsqueda por nombre y lote activada. ' +
         '<a href="/pricing">Suscríbete para no perder acceso</a>';
+      // Popup modal on last day of trial
+      if (daysLeft <= 1) setTimeout(() => showTrialExpiryPopup(daysLeft), 2000);
+    }
+
+    // Pending single-purchase credits banner
+    const pcBanner = document.getElementById('pending-creds-banner');
+    if (pcBanner) {
+      if (!isAdmin && extraCreds > 0) {
+        const label = extraCreds === 1 ? '1 escritura lista para descargar' : `${extraCreds} escrituras listas para descargar`;
+        document.getElementById('pending-creds-title').textContent = `Tienes ${label}`;
+        pcBanner.style.display = 'flex';
+      } else {
+        pcBanner.style.display = 'none';
+      }
     }
 
     // Warn when ≤ 2 downloads left
@@ -4196,7 +4640,7 @@ document.addEventListener('DOMContentLoaded', loadUserBar);
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function switchTab(tab) {
-  const tabs = ['folio', 'nombre', 'lote', 'agua', 'predial'];
+  const tabs = ['folio', 'nombre', 'lote', 'agua', 'predial', 'sat'];
   const isFree = _userInfo && _userInfo.sub_status !== 'active' && _userInfo.role !== 'admin' && !_userInfo.in_trial && !_userInfo.is_team_member;
   const locked = (tab === 'nombre' && isFree) || (tab === 'lote' && !_canLote());
   if (locked) {
@@ -4285,6 +4729,25 @@ function cancelarBusqueda(id) {
   }
 }
 
+// ── Download helper (fetch + blob — works in all browsers) ────────────────────
+async function _triggerDownload(url, filename) {
+  try {
+    const r = await fetch(url, {credentials: 'include'});
+    if (!r.ok) { showToastWarning('Error al descargar PDF (' + r.status + ')'); return; }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    loadUserBar();
+  } catch(e) {
+    showToastWarning('Error de descarga: ' + e.message);
+  }
+}
+
 // ── Folio search ──────────────────────────────────────────────────────────────
 let _autoDownload = false; // set true by recent-download chips
 
@@ -4343,7 +4806,7 @@ async function buscarFolio() {
 function pollFolioJob(job_id, folio, btn, statusEl, autoDownload) {
   const poll = _searchState.folio.poll = setInterval(async () => {
     // Re-evaluate isFree at result time so loadUserBar updates are captured
-    const isFree = _userInfo && _userInfo.sub_status !== 'active' && _userInfo.role !== 'admin' && !(_userInfo && _userInfo.in_trial) && !(_userInfo && _userInfo.is_team_member);
+    const isFree = _userInfo && _userInfo.sub_status !== 'active' && _userInfo.role !== 'admin' && !(_userInfo && _userInfo.in_trial) && !(_userInfo && _userInfo.is_team_member) && !(_userInfo && (_userInfo.extra_credits || 0) > 0);
     try {
       const sr = await fetch('/status/' + job_id);
       const s  = await sr.json();
@@ -4364,25 +4827,13 @@ function pollFolioJob(job_id, folio, btn, statusEl, autoDownload) {
             + alertBtn;
         } else {
             const inscBtn = s.has_inscripcion
-            ? ' &nbsp;<a class="dl-btn" style="background:#1d4ed8" href="/download/' + job_id + '/inscripcion" download="inscripcion_' + folio + '.pdf" id="dl-insc-' + job_id + '" onclick="showToastSuccess(\'✓ Descargando inscripción...\')">&#11015; Inscripción</a>'
+            ? ' &nbsp;<button id="dl-insc-' + job_id + '" class="dl-btn" style="background:#1d4ed8;border:none;cursor:pointer" onclick="showToastSuccess(\'✓ Descargando inscripción...\');_triggerDownload(\'/download/' + job_id + '/inscripcion\',\'inscripcion_' + folio + '.pdf\')">&#11015; Inscripción</button>'
             : '';
           statusEl.innerHTML = '&#10003; Documento listo &nbsp;'
             + previewBtn
-            + ' &nbsp;<a id="dl-auto-' + job_id + '" class="dl-btn" href="/download/' + job_id + '" download="folio_' + folio + '_sin_marca.pdf" onclick="loadUserBar();showToastSuccess(\'✓ Descargando escritura...\')">&#11015; Descargar</a>'
+            + ' &nbsp;<button id="dl-auto-' + job_id + '" class="dl-btn" style="border:none;cursor:pointer" onclick="showToastSuccess(\'✓ Descargando escritura...\');_triggerDownload(\'/download/' + job_id + '\',\'folio_' + folio + '_sin_marca.pdf\')">&#11015; Descargar</button>'
             + inscBtn
             + alertBtn;
-          if (autoDownload) {
-            setTimeout(() => {
-              const a = document.getElementById('dl-auto-' + job_id);
-              if (a) { loadUserBar(); showToastSuccess('✓ Descargando escritura...'); a.click(); }
-            }, 200);
-            if (s.has_inscripcion) {
-              setTimeout(() => {
-                const ai = document.getElementById('dl-insc-' + job_id);
-                if (ai) { showToastSuccess('✓ Descargando inscripción...'); ai.click(); }
-              }, 1200);
-            }
-          }
         }
         btn.disabled = false;
         // Inject gravámenes / antecedentes bar below status
@@ -4460,7 +4911,8 @@ async function buscarNombre() {
           }
           let totalProps = data.reduce((a, r) => a + r.propiedades.length, 0);
           status2.className = 'success';
-          status2.innerHTML = '&#10003; Se encontró ' + data.length + ' propietario(s) con ' + totalProps + ' propiedad(es).';
+          status2.innerHTML = '&#10003; Se encontró ' + data.length + ' propietario(s) con ' + totalProps + ' propiedad(es).'
+            + (s.censored ? ' <span style="color:#f59e0b;font-size:.8rem">🔒 Nombres censurados — <a href="/pricing" style="color:#f59e0b">suscríbete</a> para ver datos completos</span>' : '');
           renderResultados(data);
         } else if (s.status === 'error') {
           clearInterval(_searchState.nombre.poll); _searchState.nombre.poll = null; _hideCancel('nombre');
@@ -4486,51 +4938,67 @@ async function buscarNombre() {
 function renderResultados(data) {
   const container = document.getElementById('results-container');
   container.style.display = 'block';
-  let html = '<div class="results-title">Propiedades encontradas</div>';
+  const totalProps = data.reduce((a, r) => a + (r.propiedades || []).length, 0);
+  let html = `<div class="results-title">${totalProps} propiedad${totalProps !== 1 ? 'es' : ''} encontrada${totalProps !== 1 ? 's' : ''}</div>`;
+
   for (const r of data) {
     const p = r.propietario;
     const nombreCompleto = [p.nombre, p.paterno, p.materno].filter(Boolean).join(' ');
-    html += `<div class="prop-card">
-      <div class="prop-card-header">
-        <span class="prop-person-name">${nombreCompleto}</span>
-        <span class="prop-distrito">${p.distrito || ''}</span>
+    const initials = (p.paterno || p.nombre || '?')[0].toUpperCase();
+
+    html += `<div class="prop-owner-group">
+      <div class="prop-owner-header">
+        <div class="prop-owner-avatar">${initials}</div>
+        <div>
+          <div class="prop-person-name">${nombreCompleto}</div>
+          ${p.distrito ? `<div style="margin-top:.15rem"><span class="prop-distrito">${p.distrito}</span></div>` : ''}
+        </div>
       </div>`;
+
     if (!r.propiedades || r.propiedades.length === 0) {
-      html += '<div style="padding:.75rem 1rem;color:#555;font-size:.875rem;">Sin propiedades registradas.</div>';
+      html += '<div style="color:#555;font-size:.82rem;padding:.5rem 0 1rem">Sin propiedades registradas.</div>';
     } else {
-      html += `<div class="prop-table-wrap"><table class="prop-table">
-        <thead><tr>
-          <th>Folio Real</th><th>Domicilio</th><th>Colonia</th>
-          <th>Municipio</th><th>Superficie</th><th>Clave Catastral</th><th></th>
-        </tr></thead><tbody>`;
+      html += '<div class="prop-cards-grid">';
       for (const prop of r.propiedades) {
         const sup = prop.sup_rest ? prop.sup_rest + ' ' + (prop.unidad || '') : '—';
-        html += `<tr>
-          <td><span class="folio-badge">${prop.folio_real}</span></td>
-          <td>${prop.domicilio || '—'}</td><td>${prop.colonia || '—'}</td>
-          <td>${prop.municipio || '—'}</td><td>${sup}</td>
-          <td>${prop.clave_cat || '—'}</td>
-          <td style="white-space:nowrap">${prop.tiene_agregado
-            ? `<button class="dl-row-btn" id="dlbtn-${prop.folio_real}"
-                 data-nombre="${nombreCompleto.replace(/"/g,'&quot;')}"
-                 onclick="descargarPropiedad(${prop.folio_real}, this, this.dataset.nombre)">&#11015; PDF</button>`
-            : '<span class="no-pdf">Sin PDF</span>'
-          }
-          &nbsp;<button onclick="toggleExtrasSection('grav-n${prop.folio_real}','${prop.folio_real}','gravamenes')"
-            id="btn-grav-n${prop.folio_real}"
-            style="background:#1e1b4b;border:1px solid #4c1d95;color:#a78bfa;border-radius:6px;padding:.2rem .5rem;font-size:.72rem;cursor:pointer;white-space:nowrap">⚖️</button>
-          &nbsp;<button onclick="toggleExtrasSection('ant-n${prop.folio_real}','${prop.folio_real}','antecedentes')"
-            id="btn-ant-n${prop.folio_real}"
-            style="background:#1c1407;border:1px solid #92400e;color:#fbbf24;border-radius:6px;padding:.2rem .5rem;font-size:.72rem;cursor:pointer;white-space:nowrap">📋</button>
-          </td></tr>
-          <tr id="extras-row-${prop.folio_real}" style="display:none">
-            <td colspan="7" style="padding:.5rem 1rem .5rem 2rem">
-              <div id="grav-n${prop.folio_real}" style="display:none;margin-bottom:.4rem;padding:.6rem;background:#0a0f1e;border-radius:8px;border:1px solid #1e1b4b"></div>
-              <div id="ant-n${prop.folio_real}" style="display:none;padding:.6rem;background:#0a0f1e;border-radius:8px;border:1px solid #1c1a0a"></div>
-            </td>
-          </tr>`;
+        const addressLine = [prop.domicilio, prop.colonia, prop.municipio].filter(Boolean).join(' · ');
+        const safeNombre = nombreCompleto.replace(/"/g, '&quot;');
+
+        html += `<div class="prop-item-card">
+          <div class="prop-item-top">
+            <div>
+              <div class="prop-item-folio">
+                <span class="folio-badge">${prop.folio_real}</span>
+              </div>
+              ${addressLine ? `<div class="prop-item-address">${addressLine}</div>` : ''}
+            </div>
+            <div class="prop-item-actions">
+              ${prop.tiene_agregado
+                ? `<button class="dl-row-btn" id="dlbtn-${prop.folio_real}"
+                     data-nombre="${safeNombre}"
+                     onclick="descargarPropiedad(${prop.folio_real}, this, this.dataset.nombre)">⬇ PDF</button>`
+                : '<span class="no-pdf">Sin PDF</span>'
+              }
+              <button class="prop-icon-btn" title="Gravámenes"
+                onclick="toggleExtrasSection('grav-n${prop.folio_real}','${prop.folio_real}','gravamenes')"
+                id="btn-grav-n${prop.folio_real}">⚖️</button>
+              <button class="prop-icon-btn" title="Antecedentes"
+                onclick="toggleExtrasSection('ant-n${prop.folio_real}','${prop.folio_real}','antecedentes')"
+                id="btn-ant-n${prop.folio_real}">📋</button>
+            </div>
+          </div>
+          <div class="prop-item-meta">
+            ${prop.sup_rest ? `<div class="prop-meta-chip"><span class="prop-meta-label">Superficie</span><span class="prop-meta-val">${sup}</span></div>` : ''}
+            ${prop.clave_cat ? `<div class="prop-meta-chip"><span class="prop-meta-label">Clave Catastral</span><span class="prop-meta-val">${prop.clave_cat}</span></div>` : ''}
+            ${prop.municipio ? `<div class="prop-meta-chip"><span class="prop-meta-label">Municipio</span><span class="prop-meta-val">${prop.municipio}</span></div>` : ''}
+          </div>
+          <div class="prop-extras-panel" id="extras-row-${prop.folio_real}" style="display:none">
+            <div id="grav-n${prop.folio_real}" style="display:none;margin-bottom:.4rem;padding:.6rem;background:#0a0f1e;border-radius:8px;border:1px solid #1e1b4b"></div>
+            <div id="ant-n${prop.folio_real}" style="display:none;padding:.6rem;background:#0a0f1e;border-radius:8px;border:1px solid #1c1a0a"></div>
+          </div>
+        </div>`;
       }
-      html += '</tbody></table></div>';
+      html += '</div>';
     }
     html += '</div>';
   }
@@ -4577,38 +5045,31 @@ async function descargarPropiedad(folioReal, btnEl, nombreProp) {
           btnEl.textContent = '✓ Listo';
           // Insert preview + download buttons after the row button
           const cell = btnEl.parentElement;
-          const dl = document.createElement('a');
+          const dl = document.createElement('button');
           dl.className = 'dl-row-btn';
-          dl.style.cssText = 'margin-left:.4rem;text-decoration:none;display:inline-block;padding:.3rem .7rem;font-size:.75rem';
-          dl.href = '/download/' + job_id;
-          dl.download = 'folio_' + folioReal + '_sin_marca.pdf';
+          dl.style.cssText = 'margin-left:.4rem;padding:.3rem .7rem;font-size:.75rem';
           dl.textContent = '⬇';
           dl.title = 'Descargar escritura';
-          dl.onclick = () => { loadUserBar(); showToastSuccess('✓ Descargando escritura...'); };
+          dl.onclick = () => { showToastSuccess('✓ Descargando escritura...'); _triggerDownload('/download/' + job_id, 'folio_' + folioReal + '_sin_marca.pdf'); };
           cell.appendChild(dl);
           if (s.has_inscripcion) {
-            const di = document.createElement('a');
+            const di = document.createElement('button');
             di.className = 'dl-row-btn';
-            di.style.cssText = 'margin-left:.3rem;text-decoration:none;display:inline-block;padding:.3rem .7rem;font-size:.75rem;background:#1d4ed8';
-            di.href = '/download/' + job_id + '/inscripcion';
-            di.download = 'inscripcion_' + folioReal + '.pdf';
+            di.style.cssText = 'margin-left:.3rem;padding:.3rem .7rem;font-size:.75rem;background:#1d4ed8';
             di.textContent = '⬇ Insc.';
             di.title = 'Descargar inscripción';
-            di.onclick = () => showToastSuccess('✓ Descargando inscripción...');
+            di.onclick = () => { showToastSuccess('✓ Descargando inscripción...'); _triggerDownload('/download/' + job_id + '/inscripcion', 'inscripcion_' + folioReal + '.pdf'); };
             cell.appendChild(di);
-            setTimeout(() => { showToastSuccess('✓ Descargando escritura...'); dl.click(); }, 200);
-            setTimeout(() => { showToastSuccess('✓ Descargando inscripción...'); di.click(); }, 1200);
-          } else {
-            setTimeout(() => { loadUserBar(); showToastSuccess('✓ Descargando escritura...'); dl.click(); }, 200);
           }
           if (_canPreview()) {
             const prev = document.createElement('button');
             prev.className = 'btn-preview';
             prev.style.cssText = 'margin-left:.4rem;padding:.25rem .6rem;font-size:.75rem';
-            prev.textContent = '👁';
+            prev.textContent = '👁 Vista previa';
             prev.title = 'Vista previa';
             prev.onclick = () => openPreview(job_id, String(folioReal));
             cell.appendChild(prev);
+            setTimeout(() => openPreview(job_id, String(folioReal)), 300);
           } else {
             const lockPrev = document.createElement('a');
             lockPrev.href = '/pricing';
@@ -4638,13 +5099,42 @@ async function descargarPropiedad(folioReal, btnEl, nombreProp) {
 }
 
 // ── Quota modal ───────────────────────────────────────────────────────────────
+const _QUOTA_PLAN_LIST = [
+  {id:'basico',      label:'Básico',      desc:'5 desc/mes',   price:'$500/mes'},
+  {id:'pro',         label:'Pro',         desc:'10 desc/mes',  price:'$1,000/mes'},
+  {id:'empresarial', label:'Empresarial', desc:'20 desc/mes',  price:'$2,000/mes'},
+  {id:'corporativo', label:'Corporativo', desc:'100 desc/mes', price:'$5,000/mes'},
+];
+const _QUOTA_PLAN_ORDER = ['basico','pro','empresarial','corporativo','corporativo_pro'];
+const _QUOTA_PLAN_LIMITS = {basico:5,pro:10,empresarial:20,corporativo:100,corporativo_pro:500};
+const _QUOTA_PLAN_NAMES  = {basico:'Básico',pro:'Pro',empresarial:'Empresarial',corporativo:'Corporativo',corporativo_pro:'Corp. Pro'};
+
+function _buildQuotaPlanCards(containerEl, currentPlan) {
+  const curIdx   = _QUOTA_PLAN_ORDER.indexOf(currentPlan || '');
+  const upgrades = _QUOTA_PLAN_LIST.filter(p => _QUOTA_PLAN_ORDER.indexOf(p.id) > curIdx);
+  if (!upgrades.length) {
+    containerEl.innerHTML = '<div style="color:#666;font-size:.78rem;text-align:center;padding:.4rem 0">Ya tienes el plan más alto.<br>Usa una descarga extra.</div>';
+  } else {
+    containerEl.innerHTML = upgrades.map(p =>
+      '<div onclick="window.location=\'/pricing\'" style="background:#080810;border:1px solid #1a1a2a;border-radius:9px;padding:.6rem .45rem;text-align:center;cursor:pointer;transition:border-color .15s" onmouseover="this.style.borderColor=\'#8b9cf4\'" onmouseout="this.style.borderColor=\'#1a1a2a\'">' +
+        '<div style="font-weight:700;color:#dde0e8;font-size:.8rem">' + p.label + '</div>' +
+        '<div style="color:#8b9cf4;font-size:.72rem;margin:.12rem 0">' + p.desc + '</div>' +
+        '<div style="color:#555;font-size:.67rem">' + p.price + '</div>' +
+      '</div>'
+    ).join('');
+  }
+}
+
 function showQuotaModal(folio, btn) {
   _pendingFolio = folio;
   _pendingBtn   = btn || null;
-  const plan = (_userInfo && _userInfo.plan) ? {basico:'Básico',pro:'Pro',empresarial:'Empresarial'}[_userInfo.plan] : 'tu plan';
-  document.getElementById('quota-msg').textContent =
-    'Has usado todas las descargas de ' + plan + ' este mes. ' +
-    'Puedes comprar una descarga extra por $130 MXN.';
+  const curPlan  = _userInfo && _userInfo.plan ? _userInfo.plan : '';
+  const curLabel = _QUOTA_PLAN_NAMES[curPlan] || 'tu plan';
+  const curLimit = _QUOTA_PLAN_LIMITS[curPlan] || 0;
+  document.getElementById('quota-msg').textContent = curLimit > 0
+    ? 'Plan ' + curLabel + ' — ' + curLimit + ' descarga' + (curLimit === 1 ? '' : 's') + '/mes agotadas'
+    : 'Has usado todas tus descargas disponibles este mes.';
+  _buildQuotaPlanCards(document.getElementById('quota-plan-options'), curPlan);
   document.getElementById('quota-modal').style.display = 'flex';
 }
 
@@ -4654,6 +5144,8 @@ function closeQuotaModal() {
 }
 
 async function buyExtraAndDownload() {
+  if (_payInProgress) return;
+  _payInProgress = true;
   closeQuotaModal();
   try {
     const res = await fetch('/create-checkout/extra', {
@@ -4663,8 +5155,8 @@ async function buyExtraAndDownload() {
     });
     const d = await res.json();
     if (d.url) window.location = d.url;
-    else alert('Error al crear sesión de pago: ' + (d.error || ''));
-  } catch(e) { alert('Error de red'); }
+    else { _payInProgress = false; alert('Error al crear sesión de pago: ' + (d.error || '')); }
+  } catch(e) { _payInProgress = false; alert('Error de red'); }
 }
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────────
@@ -4890,7 +5382,7 @@ async function loadAcctContent() {
           '<button onclick="navigator.clipboard.writeText(\'https://consulta-rpp.javisnes.com/r/' + d.referral_code + '\');this.textContent=\'✓\';setTimeout(()=>this.textContent=\'Copiar\',2000)" ' +
             'style="background:#6366f1;color:#fff;border:none;border-radius:5px;padding:.3rem .6rem;font-size:.75rem;cursor:pointer">Copiar</button>' +
         '</div>' +
-        '<p style="color:#555;font-size:.75rem;margin-top:.3rem">Ambos reciben 1 descarga gratis al registrarse con tu link.</p>'
+        '<p style="color:#555;font-size:.75rem;margin-top:.3rem">Cuando tu referido se suscriba, ambos reciben 1 descarga gratis.</p>'
         : '') +
       '<div style="margin-top:1rem;display:flex;gap:.5rem;flex-wrap:wrap">' +
       (d.is_team_member ? '' : '<button onclick="window.location=\'/pricing\'" style="flex:1;padding:.5rem;background:#1d1d35;color:#8b9cf4;border:1px solid #3a3a5a;border-radius:7px;cursor:pointer;font-size:.875rem">Ver planes</button>') +
@@ -4935,6 +5427,26 @@ document.addEventListener('DOMContentLoaded', () => {
     const el = document.getElementById('status-footer-link');
     if(el) el.innerHTML = (d.ok ? '<span style="color:#4ade80">●</span>' : '<span style="color:#f87171">●</span>') + ' Estado del servicio';
   }).catch(()=>{});
+
+  // Auto-search after payment redirect: /?auto_folio=XXXXX
+  const _autoFolioParam = new URLSearchParams(window.location.search).get('auto_folio');
+  if (_autoFolioParam) {
+    history.replaceState(null, '', window.location.pathname);
+    const _doAutoSearch = () => {
+      switchTab('folio');
+      const inp = document.getElementById('folio');
+      if (inp) {
+        inp.value = _autoFolioParam;
+        showToastSuccess('✅ Pago recibido — buscando tu escritura...');
+        buscarFolio();
+      }
+    };
+    // Force re-fetch /me to capture the newly created credit (don't use cached _userInfo)
+    fetch('/me').then(r => r.json()).then(u => {
+      if (u && !u.error) { _userInfo = u; renderUserInfo(u); }
+      setTimeout(_doAutoSearch, 600);
+    }).catch(() => setTimeout(_doAutoSearch, 1800));
+  }
 });
 
 function showOnboarding() {
@@ -4982,6 +5494,47 @@ function showOnboarding() {
   document.head.appendChild(style);
 }
 
+// ── Trial expiry popup (shown on last day, once per day) ──────────────────────
+function showTrialExpiryPopup(daysLeft) {
+  if (document.getElementById('trial-exp-popup')) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (localStorage.getItem('rpp_trial_popup_' + today)) return;
+  const isToday = daysLeft <= 0;
+  const ov = document.createElement('div');
+  ov.id = 'trial-exp-popup';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:9100;display:flex;align-items:center;justify-content:center;padding:1rem;animation:obFadeIn .35s';
+  ov.innerHTML = `
+    <div style="background:#0f0f18;border:2px solid #f59e0b;border-radius:16px;padding:2rem;max-width:380px;width:100%;position:relative;box-shadow:0 20px 60px rgba(245,158,11,.25);text-align:center">
+      <div style="font-size:2.8rem;margin-bottom:.6rem">${isToday ? '⏰' : '⚠️'}</div>
+      <h3 style="font-size:1.15rem;font-weight:700;color:#f59e0b;margin-bottom:.5rem">
+        ${isToday ? 'Tu trial expira hoy' : 'Tu trial expira mañana'}
+      </h3>
+      <p style="font-size:.875rem;color:#aaa;line-height:1.65;margin-bottom:1.4rem">
+        ${isToday
+          ? 'Hoy es el último día de tu acceso gratuito. Suscríbete ahora para mantener búsquedas ilimitadas y descargas sin cortes.'
+          : 'Mañana termina tu período de prueba. Elige un plan hoy y no pierdas ni un minuto de acceso.'}
+      </p>
+      <a href="/pricing" style="display:block;padding:.78rem;background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;border-radius:10px;font-weight:700;font-size:.95rem;text-decoration:none;margin-bottom:.65rem;letter-spacing:.01em">
+        🚀 Ver planes — desde $500 MXN/mes
+      </a>
+      <button id="trial-popup-dismiss" style="width:100%;padding:.55rem;background:none;border:1px solid #2a2a3a;color:#666;border-radius:10px;cursor:pointer;font-size:.82rem">
+        Recordar más tarde
+      </button>
+    </div>`;
+  document.body.appendChild(ov);
+  document.getElementById('trial-popup-dismiss').addEventListener('click', () => {
+    ov.remove();
+    localStorage.setItem('rpp_trial_popup_' + today, '1');
+  });
+  // Ensure animation keyframe exists
+  if (!document.getElementById('ob-anim-style')) {
+    const st = document.createElement('style');
+    st.id = 'ob-anim-style';
+    st.textContent = '@keyframes obFadeIn{from{opacity:0}to{opacity:1}}';
+    document.head.appendChild(st);
+  }
+}
+
 function showPwaBanner() {
   if (document.getElementById('pwa-banner')) return;
   const b = document.createElement('div');
@@ -5009,7 +5562,7 @@ function openPreview(job_id, folio) {
   const overlay = document.getElementById('preview-overlay');
   const iframe  = document.getElementById('preview-iframe');
   const dlBtn   = document.getElementById('preview-dl-btn');
-  const isFree  = _userInfo && _userInfo.sub_status !== 'active' && _userInfo.role !== 'admin' && !(_userInfo && _userInfo.in_trial) && !(_userInfo && _userInfo.is_team_member);
+  const isFree  = _userInfo && _userInfo.sub_status !== 'active' && _userInfo.role !== 'admin' && !(_userInfo && _userInfo.in_trial) && !(_userInfo && _userInfo.is_team_member) && !(_userInfo && (_userInfo.extra_credits || 0) > 0);
   document.getElementById('preview-title').textContent = 'Vista previa — Folio ' + folio;
   iframe.src = '/preview/' + job_id;
   if (isFree) {
@@ -5214,15 +5767,42 @@ async function buscarAgua() {
 }
 
 // ── Gravámenes / Antecedentes inline helpers ──────────────────────────────────
-function _renderGravamenes(d) {
+function _renderGravamenes(d, folio) {
   if (!d.gravamenes || d.gravamenes.length === 0)
     return '<div style="color:#4ade80;padding:.5rem 0">&#10003; Sin gravámenes registrados</div>';
+  const PAID_PLANS = ['basico','pro','empresarial','corporativo','corporativo_pro'];
+  const u = _userInfo;
+  const hasPlan = u && (u.role === 'admin' || u.in_trial || (u.sub_status === 'active' && PAID_PLANS.includes(u.plan)) || u.is_team_member);
   const rows = d.gravamenes.map(g => {
-    const fecha = g.fecha ? g.fecha.slice(0,10).split('-').reverse().join('/') : '—';
+    const _fd = g.fecha || '';
+    const fecha = _fd
+      ? (_fd.includes('-') ? _fd.slice(0,10).split('-').reverse().join('/') : _fd)
+      : '—';
     const vigente = g.vigente === 'S';
     const badge = vigente
       ? '<span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:99px;font-size:.72rem;font-weight:700">VIGENTE</span>'
       : '<span style="background:#374151;color:#9ca3af;padding:2px 8px;border-radius:99px;font-size:.72rem">CANCELADO</span>';
+    const partida = parseInt(g.partida) || 0;
+    let docBtns = '';
+    if (g.tieneAgregado && partida > 0) {
+      const encodedActo = encodeURIComponent((g.acto||'').slice(0,60));
+      if (hasPlan) {
+        docBtns = `<div style="margin-top:.4rem;display:flex;gap:.4rem;flex-wrap:wrap">
+          <button onclick="verPreviaAnteced(${partida},'${folio}','${encodedActo}')"
+            style="padding:.15rem .5rem;font-size:.7rem;background:#1e3a5f;color:#93c5fd;border:1px solid #2563eb;border-radius:3px;cursor:pointer;line-height:1.4">
+            🔍 Vista previa</button>
+          <button onclick="confirmarDescargaAnteced(${partida},'${folio}')"
+            style="padding:.15rem .5rem;font-size:.7rem;background:#14532d;color:#86efac;border:1px solid #16a34a;border-radius:3px;cursor:pointer;line-height:1.4">
+            ⬇ Descargar sin marca</button>
+        </div>`;
+      } else {
+        docBtns = `<div style="margin-top:.4rem">
+          <span onclick="window.location='/pricing'" title="Requiere plan Básico o superior"
+            style="display:inline-block;padding:.15rem .5rem;font-size:.7rem;background:#1c1407;color:#fbbf24;border:1px solid #92400e;border-radius:3px;cursor:pointer;line-height:1.4">
+            🔒 Básico+ para ver documento</span>
+        </div>`;
+      }
+    }
     return `<div style="border:1px solid ${vigente?'#7c3aed':'#374151'};border-radius:8px;padding:.7rem;margin-bottom:.5rem;background:#0f172a">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.4rem">
         <span style="color:#a78bfa;font-weight:700;font-size:.88rem">${g.acto || '—'}</span>${badge}
@@ -5234,6 +5814,7 @@ function _renderGravamenes(d) {
         <span>Sección: <b style="color:#f1f5f9">${g.seccion||'—'}</b></span>
       </div>
       ${g.datosActo?`<div style="margin-top:.4rem;font-size:.76rem;color:#cbd5e1;line-height:1.35">${g.datosActo.slice(0,280)}${g.datosActo.length>280?'…':''}</div>`:''}
+      ${docBtns}
     </div>`;
   }).join('');
   return `<div style="color:#a78bfa;font-size:.8rem;margin-bottom:.4rem;font-weight:600">⚖️ ${d.gravamenes.length} gravamen(es)</div>${rows}`;
@@ -5308,12 +5889,13 @@ function closeAntecedQuotaModal() {
 }
 
 function showAntecedQuotaModal() {
-  const u = _userInfo;
-  const PLAN_NAMES = {basico:'Básico',pro:'Pro',empresarial:'Empresarial',corporativo:'Corporativo',corporativo_pro:'Corp. Pro'};
-  const planLabel = (u && u.plan && PLAN_NAMES[u.plan]) ? PLAN_NAMES[u.plan] : (u && u.plan ? u.plan : 'tu plan');
-  document.getElementById('anteced-quota-msg').textContent =
-    'Agotaste las descargas de ' + planLabel + ' este mes. ' +
-    'Compra una descarga extra por $130 MXN o mejora tu plan.';
+  const curPlan  = _userInfo && _userInfo.plan ? _userInfo.plan : '';
+  const curLabel = _QUOTA_PLAN_NAMES[curPlan] || 'tu plan';
+  const curLimit = _QUOTA_PLAN_LIMITS[curPlan] || 0;
+  document.getElementById('anteced-quota-msg').textContent = curLimit > 0
+    ? 'Plan ' + curLabel + ' — ' + curLimit + ' descarga' + (curLimit === 1 ? '' : 's') + '/mes agotadas'
+    : 'No tienes descargas disponibles este mes.';
+  _buildQuotaPlanCards(document.getElementById('anteced-quota-plan-options'), curPlan);
   document.getElementById('anteced-quota-modal').style.display = 'flex';
 }
 
@@ -5517,7 +6099,7 @@ async function toggleExtrasSection(containerId, folio, tipo) {
     const d = await res.json();
     if (!res.ok) { el.innerHTML = `<div style="color:#f87171;font-size:.8rem">&#10060; ${d.error||'Error'}</div>`; }
     else {
-      el.innerHTML = tipo === 'gravamenes' ? _renderGravamenes(d) : _renderAntecedentes(d, folio);
+      el.innerHTML = tipo === 'gravamenes' ? _renderGravamenes(d, folio) : _renderAntecedentes(d, folio);
       el.dataset.loaded = '1';
     }
   } catch(e) { el.innerHTML = `<div style="color:#f87171;font-size:.8rem">&#10060; Error de red</div>`; }
@@ -5542,94 +6124,218 @@ function _injectExtrasBar(containerEl, folio) {
 
 
 // ── SAT / RFC ─────────────────────────────────────────────────────────────────
-function satTipoChange() {
-  const tipo = document.querySelector('input[name="sat-tipo"]:checked')?.value || 'F';
+function setSATTipo(v) {
+  document.getElementById('sat-tipo-val').value = v;
+  const on  = 'border:2px solid #7c3aed;background:#3b0764;color:#e9d5ff';
+  const off = 'border:2px solid #374151;background:transparent;color:#9ca3af';
+  document.getElementById('sat-btn-F').style.cssText = document.getElementById('sat-btn-F').style.cssText.replace(/border.*?(?=;|$)/,'') + (v==='F' ? on : off);
+  document.getElementById('sat-btn-M').style.cssText = document.getElementById('sat-btn-M').style.cssText.replace(/border.*?(?=;|$)/,'') + (v==='M' ? on : off);
+  document.getElementById('sat-btn-F').innerHTML = (v==='F' ? '&#9679;' : '&#9675;') + ' Persona F\u00edsica';
+  document.getElementById('sat-btn-M').innerHTML = (v==='M' ? '&#9679;' : '&#9675;') + ' Persona Moral';
   const docRow = document.getElementById('sat-doc-row');
-  if (docRow) docRow.style.display = tipo === 'F' ? 'flex' : 'none';
+  if (docRow) docRow.style.display = v === 'F' ? '' : 'none';
 }
+function setSATDoc(v) {
+  document.getElementById('sat-doc-val').value = v;
+  document.getElementById('sat-btn-RFC').innerHTML  = (v==='RFC'  ? '&#9679;' : '&#9675;') + ' RFC';
+  document.getElementById('sat-btn-CURP').innerHTML = (v==='CURP' ? '&#9679;' : '&#9675;') + ' CURP';
+  const on  = 'flex:1;padding:.45rem;border-radius:8px;font-size:.85rem;font-weight:600;cursor:pointer;border:2px solid #7c3aed;background:#3b0764;color:#e9d5ff';
+  const off = 'flex:1;padding:.45rem;border-radius:8px;font-size:.85rem;font-weight:600;cursor:pointer;border:2px solid #374151;background:transparent;color:#9ca3af';
+  document.getElementById('sat-btn-RFC').style.cssText  = v==='RFC'  ? on : off;
+  document.getElementById('sat-btn-CURP').style.cssText = v==='CURP' ? on : off;
+}
+function satTipoChange() { setSATTipo(document.getElementById('sat-tipo-val')?.value || 'F'); }
 
 async function buscarSAT() {
-  const value    = (document.getElementById('sat-value').value || '').trim().toUpperCase();
-  const tipo     = document.querySelector('input[name="sat-tipo"]:checked')?.value || 'F';
-  const doc_type = document.querySelector('input[name="sat-doc"]:checked')?.value  || 'RFC';
+  const curp     = (document.getElementById('sat-value').value || '').trim().toUpperCase();
   const btn      = document.getElementById('btn-sat');
   const statusEl = document.getElementById('sat-status');
   const resultEl = document.getElementById('sat-result');
 
-  if (!value) {
+  if (!curp) { statusEl.className='error'; statusEl.style.display='block'; statusEl.innerHTML='&#10060; Ingresa una CURP.'; return; }
+  if (curp.length !== 18) { statusEl.className='error'; statusEl.style.display='block'; statusEl.innerHTML='&#10060; La CURP debe tener 18 caracteres.'; return; }
+
+  btn.disabled = true;
+  resultEl.innerHTML = '';
+  statusEl.className = 'loading'; statusEl.style.display = 'block';
+  statusEl.innerHTML = '<span class="spinner"></span>Cargando captcha del SAT\u2026';
+  _showCancel('sat');
+
+  try {
+    const res = await fetch('/curp/captcha/iniciar', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({curp}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      statusEl.className = 'error'; statusEl.innerHTML = '&#10060; ' + (err.error || 'Error al cargar SAT');
+      btn.disabled = false; _hideCancel('sat'); return;
+    }
+    const {session_id, captcha_b64} = await res.json();
+
+    statusEl.className = ''; statusEl.style.display = 'none';
+    resultEl.innerHTML = `
+      <div style="margin-top:.75rem">
+        <div style="font-size:.82rem;color:#a78bfa;margin-bottom:.5rem">Ingresa el texto de la imagen:</div>
+        <img src="data:image/png;base64,${captcha_b64}" style="border-radius:6px;border:2px solid #7c3aed;width:100%;max-width:240px;display:block;margin-bottom:.6rem;background:#fff;padding:4px">
+        <input type="text" id="sat-captcha-input" placeholder="Escribe los caracteres" autocomplete="off"
+               style="width:100%;letter-spacing:.15em;text-transform:uppercase;font-size:1.1rem;margin-bottom:.5rem"
+               onkeydown="if(event.key==='Enter')enviarCaptchaSAT('${session_id}')">
+        <button class="search-btn" onclick="enviarCaptchaSAT('${session_id}')"
+                style="width:100%;background:linear-gradient(135deg,#7c3aed,#6d28d9)">Buscar &#10148;</button>
+      </div>`;
+    document.getElementById('sat-captcha-input')?.focus();
+    btn.disabled = false; _hideCancel('sat');
+  } catch(e) {
+    statusEl.className = 'error'; statusEl.innerHTML = '&#10060; Error: ' + e.message;
+    btn.disabled = false; _hideCancel('sat');
+  }
+}
+
+async function enviarCaptchaSAT(session_id) {
+  const captchaInput = document.getElementById('sat-captcha-input');
+  const captcha = (captchaInput?.value || '').trim().toUpperCase();
+  const statusEl = document.getElementById('sat-status');
+  const resultEl = document.getElementById('sat-result');
+  const btn      = document.getElementById('btn-sat');
+
+  if (!captcha) { captchaInput?.focus(); return; }
+
+  btn.disabled = true;
+  statusEl.className = 'loading'; statusEl.style.display = 'block';
+  statusEl.innerHTML = '<span class="spinner"></span>Consultando SAT\u2026';
+
+  try {
+    const res = await fetch('/curp/captcha/resolver', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id, captcha}),
+    });
+    const d = await res.json();
+    if (!res.ok) {
+      statusEl.className = 'error'; statusEl.innerHTML = '&#10060; ' + (d.error || 'Error');
+      btn.disabled = false; return;
+    }
+    resultEl.innerHTML = '';
+    _satRenderResult({
+      found:        d.rfc_found,
+      rfc:          d.rfc,
+      curp:         d.curp,
+      nombre:       d.nombre,
+      estatus:      d.mensaje || (d.rfc_found ? 'Registrado en el padr\u00f3n' : 'No localizado'),
+      tipo_persona: 'Persona F\u00edsica',
+    }, statusEl, resultEl);
+    btn.disabled = false;
+  } catch(e) {
+    statusEl.className = 'error'; statusEl.innerHTML = '&#10060; Error: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+function _satRenderResult(d, statusEl, resultEl) {
+  const fields = [
+    d.tipo_persona && ['Tipo de persona', d.tipo_persona],
+    d.rfc          && ['RFC',             d.rfc],
+    d.curp         && ['CURP',            d.curp],
+    d.nombre       && ['Nombre / Raz\u00f3n Social', d.nombre],
+    d.estatus      && ['Estatus',         d.estatus],
+  ].filter(Boolean);
+  const color = d.found ? '#4ade80' : '#f87171';
+  let html = '<div style="background:#0e1425;border:1px solid #1e2d40;border-radius:10px;padding:1rem;margin-top:.5rem">';
+  html += '<div style="font-size:.78rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.6rem">Resultado SAT</div>';
+  for (const [k,v] of fields) {
+    const isE = k === 'Estatus';
+    html += '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:.3rem 0;border-bottom:1px solid #1a2535">'
+      + '<span style="color:#64748b;font-size:.82rem">' + k + '</span>'
+      + '<span style="color:' + (isE ? color : '#e2e8f0') + ';font-size:.85rem;font-weight:' + (isE?'600':'400') + ';text-align:right;max-width:65%">' + v + '</span>'
+      + '</div>';
+  }
+  html += '</div>';
+  resultEl.innerHTML = html;
+  statusEl.className = d.found ? 'success' : 'error';
+  statusEl.innerHTML = d.found ? '&#10003; Registrado en el SAT' : '&#10060; No localizado';
+  statusEl.style.display = 'block';
+}
+
+
+// ── CURP → RFC SAT (removed) ─────────────────────────────────────────────────
+async function buscarCURP() {
+  const curp    = (document.getElementById('curp-input').value || '').trim().toUpperCase();
+  const btn     = document.getElementById('btn-curp');
+  const statusEl = document.getElementById('curp-status');
+  const resultEl = document.getElementById('curp-result');
+
+  if (!curp || curp.length !== 18) {
     statusEl.className = 'error'; statusEl.style.display = 'block';
-    statusEl.innerHTML = '&#10060; Ingresa un RFC o CURP.'; return;
+    statusEl.innerHTML = '&#10060; Ingresa una CURP válida de 18 caracteres.'; return;
   }
   btn.disabled = true;
   resultEl.innerHTML = '';
   statusEl.className = 'loading'; statusEl.style.display = 'block';
-  statusEl.innerHTML = '<span class="spinner"></span>Consultando SAT… cargando portal y resolviendo captcha (~15-20s)<div class="bar"><div class="fill"></div></div>';
-  _showCancel('sat');
+  statusEl.innerHTML = '<span class="spinner"></span>Consultando SAT\u2026 cargando portal y resolviendo captcha (~20s)<div class="bar"><div class="fill"></div></div>';
+  _showCancel('curp');
 
   try {
-    const res = await fetch('/sat/consultar', {
+    const res = await fetch('/curp/consultar', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value, tipo, doc_type}),
+      body: JSON.stringify({curp}),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       statusEl.className = 'error'; statusEl.innerHTML = '&#10060; ' + (err.error || 'Error');
-      btn.disabled = false; _hideCancel('sat'); return;
+      btn.disabled = false; _hideCancel('curp'); return;
     }
     const {job_id} = await res.json();
-    _searchState.sat.poll = setInterval(async () => {
+    _searchState.curp.poll = setInterval(async () => {
       try {
         const sr = await fetch('/status/' + job_id);
         const s  = await sr.json();
         if (s.status === 'done') {
-          clearInterval(_searchState.sat.poll); _searchState.sat.poll = null; _hideCancel('sat');
+          clearInterval(_searchState.curp.poll); _searchState.curp.poll = null; _hideCancel('curp');
           btn.disabled = false;
           const r = s.result || {};
-          if (r.found) {
+          if (r.rfc_found) {
             statusEl.className = 'success';
-            statusEl.innerHTML = '&#10003; Consulta SAT completada';
+            statusEl.innerHTML = '&#10003; RFC encontrado en el SAT';
           } else {
             statusEl.className = 'error';
-            statusEl.innerHTML = '&#10060; ' + (r.estatus || 'No localizado');
+            statusEl.innerHTML = '&#10060; ' + (r.mensaje || 'CURP no localizada en el SAT');
           }
-          // Render result card
           const fields = [
-            r.tipo_persona && ['Tipo de persona', r.tipo_persona],
-            r.rfc          && ['RFC',              r.rfc],
-            r.curp         && ['CURP',             r.curp],
-            r.nombre       && ['Nombre / Razón Social', r.nombre],
-            r.estatus      && ['Estatus',          r.estatus],
+            r.curp    && ['CURP',    r.curp],
+            r.rfc     && ['RFC',     r.rfc],
+            r.nombre  && ['Nombre',  r.nombre],
+            r.mensaje && ['Estatus', r.mensaje],
           ].filter(Boolean);
           if (fields.length) {
-            const color = r.found ? '#4ade80' : '#f87171';
+            const color = r.rfc_found ? '#4ade80' : '#f87171';
             let html = '<div style="background:#0e1425;border:1px solid #1e2d40;border-radius:10px;padding:1rem;margin-top:.75rem">';
-            html += '<div style="font-size:.78rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.7rem">Resultado SAT</div>';
+            html += '<div style="font-size:.78rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.7rem">Resultado SAT \u2014 CURP/RFC</div>';
             for (const [k,v] of fields) {
-              const isEstatus = k === 'Estatus';
-              html += `<div style="display:flex;justify-content:space-between;align-items:baseline;padding:.35rem 0;border-bottom:1px solid #1a2535">
-                <span style="color:#64748b;font-size:.82rem">${k}</span>
-                <span style="color:${isEstatus ? color : '#e2e8f0'};font-size:.85rem;font-weight:${isEstatus?'600':'400'};text-align:right;max-width:65%">${v}</span>
-              </div>`;
+              const isStatus = k === 'Estatus';
+              html += '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:.35rem 0;border-bottom:1px solid #1a2535">'
+                + '<span style="color:#64748b;font-size:.82rem">' + k + '</span>'
+                + '<span style="color:' + (isStatus ? color : '#e2e8f0') + ';font-size:.85rem;font-weight:' + (isStatus?'600':'400') + ';text-align:right;max-width:65%">' + v + '</span>'
+                + '</div>';
             }
             html += '</div>';
             resultEl.innerHTML = html;
           }
         } else if (s.status === 'error') {
-          clearInterval(_searchState.sat.poll); _searchState.sat.poll = null; _hideCancel('sat');
+          clearInterval(_searchState.curp.poll); _searchState.curp.poll = null; _hideCancel('curp');
           statusEl.className = 'error';
           statusEl.innerHTML = '&#10060; ' + s.error;
           btn.disabled = false;
         }
       } catch(e) {
-        clearInterval(_searchState.sat.poll); _searchState.sat.poll = null; _hideCancel('sat');
+        clearInterval(_searchState.curp.poll); _searchState.curp.poll = null; _hideCancel('curp');
         statusEl.className = 'error'; statusEl.innerHTML = '&#10060; Error de red: ' + e.message;
         btn.disabled = false;
       }
     }, 3000);
   } catch(e) {
     statusEl.className = 'error'; statusEl.innerHTML = '&#10060; Error: ' + e.message;
-    btn.disabled = false; _hideCancel('sat');
+    btn.disabled = false; _hideCancel('curp');
   }
 }
 
@@ -5745,7 +6451,10 @@ async function descargarEstadoCuenta(btnEl) {
 }
 
 // ── Pay per download (single) ────────────────────────────────────────────────
+let _payInProgress = false;
 async function pagarYDescargar(jobId, folio) {
+  if (_payInProgress) return;
+  _payInProgress = true;
   try {
     const res = await fetch('/create-checkout/single', {
       method: 'POST',
@@ -5754,8 +6463,8 @@ async function pagarYDescargar(jobId, folio) {
     });
     const d = await res.json();
     if (d.url) window.location = d.url;
-    else alert('Error: ' + (d.error || 'No se pudo crear la sesión de pago'));
-  } catch(e) { alert('Error de red'); }
+    else { _payInProgress = false; alert('Error: ' + (d.error || 'No se pudo crear la sesión de pago')); }
+  } catch(e) { _payInProgress = false; alert('Error de red'); }
 }
 
 async function toggleAlert(folio, btnEl) {
@@ -5984,6 +6693,8 @@ def _login_and_open_consulta(page):
 
 # ── Folio search ───────────────────────────────────────────────────────────────
 
+
+
 def _fetch_pdf_for_folio_inner(folio_real: str) -> bytes:
     """Core folio fetch with health check and metrics."""
     global _rpp_login_time
@@ -6000,6 +6711,7 @@ def _fetch_pdf_for_folio_inner(folio_real: str) -> bytes:
             user_agent=_USER_AGENT,
         )
         page = context.new_page()
+        page.set_default_timeout(45000)
         _login_and_open_consulta(page)
         _rpp_pool_stats['logins'] += 1
         _rpp_login_time = time.time()
@@ -6083,6 +6795,9 @@ def _fetch_pdf_for_folio_inner(folio_real: str) -> bytes:
 
         response  = context.request.get(pdf_url)
         pdf_bytes = response.body()
+        if not pdf_bytes or pdf_bytes[:4] != b'%PDF':
+            browser.close()
+            raise ValueError(f"El folio {folio_real} no tiene escritura disponible en el RPP (respuesta no es PDF).")
 
         # ── Fetch inscription PDF ───────────────────────────────────────────────
         # Flow: click "Ver Inscripción" → portal calls verificarInscripcion →
@@ -6189,6 +6904,7 @@ def _fetch_properties_by_name_inner(nombre: str, paterno: str, materno: str) -> 
             user_agent=_USER_AGENT,
         )
         page = context.new_page()
+        page.set_default_timeout(45000)
         try:
             _login_and_open_consulta(page)
             _rpp_pool_stats['logins'] += 1
@@ -6356,6 +7072,7 @@ def fetch_predial_pdf(clave_catastral: str) -> bytes:  # kept for reference, unu
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
         )
         page = context.new_page()
+        page.set_default_timeout(45000)
 
         # Capture JS errors and console to debug ADF init failure
         _js_errors = []
@@ -6530,10 +7247,6 @@ def login_email():
     data     = request.get_json(silent=True) or {}
     email    = data.get('email', '').strip().lower()
     password = data.get('password', '')
-    captcha  = str(data.get('captcha', '')).strip()
-    if captcha != str(session.get('captcha_answer', '')):
-        return jsonify({'error': 'Captcha incorrecto'}), 400
-    session.pop('captcha_answer', None)
     if not email or not password:
         return jsonify({'error': 'Correo y contraseña requeridos'}), 400
     with _db() as c:
@@ -6547,6 +7260,7 @@ def login_email():
         c.execute('UPDATE users SET session_token=? WHERE id=?', (tok, u['id']))
     link_corporate_member(email, u['id'])
     session.clear()
+    session.permanent = True
     session['uid'] = u['id']
     session['tok'] = tok
     return jsonify({'ok': True, 'next': '/'})
@@ -6562,23 +7276,26 @@ def auth_magic_link():
     email = data.get('email', '').strip().lower()
     if not email or '@' not in email:
         return jsonify({'error': 'Correo inválido'}), 400
+    if _is_disposable_email(email):
+        return jsonify({'error': 'No se permiten correos temporales o desechables.'}), 400
     # Rate limit per email too
     if _rate_limited(f'magic_email_{email}', 2, 120):
         return jsonify({'error': 'Ya enviamos un link a este correo. Revisa tu bandeja.'}), 429
     # Generate token
     token = str(uuid.uuid4())
-    expires = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
+    expires = (_now() + timedelta(minutes=15)).isoformat()
     # Store token — reuse password_reset_tokens table
     with _db() as c:
-        # Find or create user
         user = c.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone()
         if user:
             uid = user['id']
         else:
-            # Auto-create account
+            # Auto-create account — same as before, prevents "email not found" confusion
+            # Duplicates are impossible because email has a unique index
+            # Note: no trial for magic-link signups — trial is Google OAuth only (anti-abuse)
             google_id = f'email:{email}'
             role = 'admin' if email == ADMIN_EMAIL else 'user'
-            trial_end = (datetime.utcnow() + timedelta(days=3)).isoformat()
+            trial_end = _now().isoformat()  # expired immediately — no trial for email signups
             cur = c.execute(
                 "INSERT INTO users(google_id,email,name,role,trial_ends) VALUES(?,?,?,?,?)",
                 (google_id, email, email.split('@')[0], role, trial_end))
@@ -6588,29 +7305,23 @@ def auth_magic_link():
             ref_code = email.split('@')[0][:10].lower() + str(uid)
             c.execute('UPDATE users SET referral_code=? WHERE id=?', (ref_code, uid))
             c.execute('INSERT OR IGNORE INTO referral_codes(user_id, code) VALUES(?,?)', (uid, ref_code))
-            # Apply referral bonus
             incoming_ref = session.get('ref_code', '')
             if incoming_ref:
                 ref_row = c.execute('SELECT user_id FROM referral_codes WHERE code=?', (incoming_ref,)).fetchone()
                 if ref_row and ref_row['user_id'] != uid:
                     if not c.execute('SELECT id FROM referral_uses WHERE referred_user_id=?', (uid,)).fetchone():
-                        c.execute('INSERT INTO referral_uses(code, referred_user_id, bonus_given) VALUES(?,?,1)',
+                        # Record referral — credits granted when referred user subscribes (anti-abuse)
+                        c.execute('INSERT INTO referral_uses(code, referred_user_id, bonus_given) VALUES(?,?,0)',
                                   (incoming_ref, uid))
-                        c.execute('INSERT INTO extra_credits(user_id, payment_intent) VALUES(?,?)',
-                                  (ref_row['user_id'], f'referral_{uid}'))
-                        c.execute('INSERT INTO extra_credits(user_id, payment_intent) VALUES(?,?)',
-                                  (uid, f'referral_bonus_{incoming_ref}'))
-            # Notify admin of new account created via magic link
             _notify_new_user(
                 name=email.split('@')[0], email=email, uid=uid,
                 method='Magic Link (cuenta nueva)',
-                ip=request.remote_addr or '',
-                ref_code=session.get('ref_code', '')
+                ip=ip, ref_code=incoming_ref
             )
         c.execute('INSERT INTO password_reset_tokens(user_id, token, expires_at) VALUES(?,?,?)',
                   (uid, token, expires))
-    # Send email
-    base_url = request.host_url.rstrip('/')
+    # Send email — always use https
+    base_url = request.host_url.rstrip('/').replace('http://', 'https://')
     body = f"""
     <div style="font-family:sans-serif;max-width:520px;margin:auto;background:#0d0d14;color:#dde0e8;padding:2rem;border-radius:12px">
       <h2 style="background:linear-gradient(120deg,#8b9cf4,#c084fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:.5rem">
@@ -6645,7 +7356,7 @@ def auth_magic_verify(token):
             return redirect('/login?msg=invalid_link')
         if row['used']:
             return redirect('/login?msg=link_used')
-        if datetime.utcnow() > datetime.fromisoformat(row['expires_at']):
+        if _now() > datetime.fromisoformat(row['expires_at']):
             return redirect('/login?msg=link_expired')
         # Mark as used
         c.execute('UPDATE password_reset_tokens SET used=1 WHERE token=?', (token,))
@@ -6659,6 +7370,7 @@ def auth_magic_verify(token):
     # Sync to Notion
     notion_sync_user_async(u)
     session.clear()
+    session.permanent = True
     session['uid'] = uid
     session['tok'] = sess_tok
     return redirect('/')
@@ -6679,6 +7391,8 @@ def register_email():
         return jsonify({'error': 'Todos los campos son requeridos'}), 400
     if len(password) < 8:
         return jsonify({'error': 'La contraseña debe tener al menos 8 caracteres'}), 400
+    if _is_disposable_email(email):
+        return jsonify({'error': 'No se permiten correos temporales o desechables.'}), 400
     pw_hash   = generate_password_hash(password)
     google_id = f'email:{email}'
     role      = 'admin' if email == ADMIN_EMAIL else 'user'
@@ -6687,7 +7401,8 @@ def register_email():
         with _db() as c:
             if c.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone():
                 return jsonify({'error': 'Este correo ya está registrado'}), 409
-            trial_end = (datetime.utcnow() + timedelta(days=3)).isoformat()
+            # No trial for email+password signups — trial is Google OAuth only (anti-abuse)
+            trial_end = _now().isoformat()  # expired immediately
             cur = c.execute(
                 """INSERT INTO users(google_id,email,name,role,session_token,trial_ends,password_hash)
                    VALUES(?,?,?,?,?,?,?)""",
@@ -6703,12 +7418,9 @@ def register_email():
                 ref_row = c.execute('SELECT user_id FROM referral_codes WHERE code=?', (incoming_ref,)).fetchone()
                 if ref_row and ref_row['user_id'] != uid:
                     if not c.execute('SELECT id FROM referral_uses WHERE referred_user_id=?', (uid,)).fetchone():
-                        c.execute('INSERT INTO referral_uses(code, referred_user_id, bonus_given) VALUES(?,?,1)',
+                        # Record referral — credits granted when referred user subscribes (anti-abuse)
+                        c.execute('INSERT INTO referral_uses(code, referred_user_id, bonus_given) VALUES(?,?,0)',
                                   (incoming_ref, uid))
-                        c.execute('INSERT INTO extra_credits(user_id, payment_intent) VALUES(?,?)',
-                                  (ref_row['user_id'], f'referral_{uid}'))
-                        c.execute('INSERT INTO extra_credits(user_id, payment_intent) VALUES(?,?)',
-                                  (uid, f'referral_bonus_{incoming_ref}'))
     except Exception as ex:
         return jsonify({'error': 'Error al crear cuenta'}), 500
     # Notify admin
@@ -6719,6 +7431,7 @@ def register_email():
         ref_code=session.get('ref_code', '')
     )
     session.clear()
+    session.permanent = True
     session['uid'] = uid
     session['tok'] = tok
     return jsonify({'ok': True, 'next': '/'})
@@ -6734,9 +7447,9 @@ def forgot_password():
     with _db() as c:
         u = c.execute('SELECT id, email, password_hash FROM users WHERE email=?', (email,)).fetchone()
     # Always show success message (don't reveal if email exists)
-    if u and u['password_hash']:
+    if u:
         token = str(uuid.uuid4())
-        expires = (datetime.utcnow() + timedelta(hours=2)).isoformat()
+        expires = (_now() + timedelta(hours=2)).isoformat()
         with _db() as c:
             c.execute('DELETE FROM password_reset_tokens WHERE user_id=?', (u['id'],))
             c.execute('INSERT INTO password_reset_tokens(user_id, token, expires_at) VALUES(?,?,?)',
@@ -6772,7 +7485,7 @@ def reset_password(token):
         ).fetchone()
     if not row:
         return render_template_string(RESET_PW_HTML, token=token, error='Enlace inválido o ya utilizado.', done=False)
-    if datetime.utcnow().isoformat() > row['expires_at']:
+    if _now().isoformat() > row['expires_at']:
         return render_template_string(RESET_PW_HTML, token=token, error='Este enlace ha expirado. Solicita uno nuevo.', done=False)
     if request.method == 'GET':
         return render_template_string(RESET_PW_HTML, token=token, error='', done=False)
@@ -6946,17 +7659,24 @@ def auth_callback():
     picture   = userinfo.get('picture', '')
     role      = 'admin' if email == ADMIN_EMAIL else 'user'
 
+    # Block disposable email domains
+    if role != 'admin' and _is_disposable_email(email):
+        return redirect(url_for('login_page') + '?msg=email_invalido')
+
     tok = str(uuid.uuid4())
 
     with _db() as c:
         existing = c.execute('SELECT id FROM users WHERE google_id=?', (google_id,)).fetchone()
+        if not existing and email:
+            # User may have registered via magic link first — merge accounts
+            existing = c.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone()
         if existing:
-            c.execute("""UPDATE users SET name=?,picture=?,session_token=?,role=?
-                         WHERE google_id=?""",
-                      (name, picture, tok, role, google_id))
+            c.execute("""UPDATE users SET name=?,picture=?,session_token=?,role=?,google_id=?
+                         WHERE id=?""",
+                      (name, picture, tok, role, google_id, existing['id']))
             uid = existing['id']
         else:
-            trial_end = (datetime.utcnow() + timedelta(days=3)).isoformat()
+            trial_end = (_now() + timedelta(days=3)).isoformat()
             cur = c.execute("""INSERT INTO users(google_id,email,name,picture,role,session_token,trial_ends)
                                 VALUES(?,?,?,?,?,?,?)""",
                             (google_id, email, name, picture, role, tok, trial_end))
@@ -6969,21 +7689,15 @@ def auth_callback():
             c.execute("UPDATE users SET referral_code=? WHERE id=?", (ref_code, uid))
             c.execute("INSERT OR IGNORE INTO referral_codes(user_id, code) VALUES(?,?)", (uid, ref_code))
 
-            # Apply referral bonus if came via referral link
+            # Record referral — credits are granted when referred user subscribes (anti-abuse)
             incoming_ref = session.get('ref_code', '')
             if incoming_ref:
                 ref_row = c.execute('SELECT user_id FROM referral_codes WHERE code=?', (incoming_ref,)).fetchone()
                 if ref_row and ref_row['user_id'] != uid:
                     already = c.execute('SELECT id FROM referral_uses WHERE referred_user_id=?', (uid,)).fetchone()
                     if not already:
-                        c.execute('INSERT INTO referral_uses(code, referred_user_id, bonus_given) VALUES(?,?,1)',
+                        c.execute('INSERT INTO referral_uses(code, referred_user_id, bonus_given) VALUES(?,?,0)',
                                   (incoming_ref, uid))
-                        # Give 1 free download credit to referrer
-                        c.execute('INSERT INTO extra_credits(user_id, payment_intent) VALUES(?,?)',
-                                  (ref_row['user_id'], f'referral_{uid}'))
-                        # Give 1 free download credit to referred user
-                        c.execute('INSERT INTO extra_credits(user_id, payment_intent) VALUES(?,?)',
-                                  (uid, f'referral_bonus_{incoming_ref}'))
 
     # Link to corporate team if invited
     link_corporate_member(email, uid)
@@ -7005,6 +7719,7 @@ def auth_callback():
 
     next_url = session.pop('next', None)
     session.clear()
+    session.permanent = True
     session['uid'] = uid
     session['tok'] = tok
     return redirect(next_url or url_for('index'))
@@ -7049,7 +7764,7 @@ def pwa_manifest():
 @app.route('/sw.js')
 def service_worker():
     sw = """
-const CACHE = 'rpp-v18';
+const CACHE = 'rpp-v72';
 const PRECACHE = ['/app.js'];
 
 self.addEventListener('install', e => {
@@ -7104,10 +7819,16 @@ def me():
     dl = get_dl_info(u)
     with _db() as c:
         pack_credits = _get_pack_credits(c, u['id'])
+        extra_credits = c.execute(
+            'SELECT COUNT(*) as n FROM extra_credits WHERE user_id=? AND used=0', (u['id'],)
+        ).fetchone()['n']
         recent_dl = c.execute(
             'SELECT folio_real, ts FROM downloads WHERE user_id=? ORDER BY ts DESC LIMIT 3',
             (u['id'],)
         ).fetchall()
+        sp_count = c.execute(
+            'SELECT COUNT(*) FROM single_purchases WHERE user_id=?', (u['id'],)
+        ).fetchone()[0]
     # Team member: use owner's period_start and billing_interval for renewal display
     period_start    = u.get('period_start', '')
     billing_interval = u.get('billing_interval', 'month')
@@ -7138,11 +7859,13 @@ def me():
         'downloads_used':   dl['used'],
         'downloads_limit':  dl['limit'],
         'pack_credits':     pack_credits,
+        'extra_credits':    extra_credits,
         'referral_code':    u.get('referral_code', ''),
         'recent_downloads': [{'folio': r['folio_real'], 'ts': r['ts']} for r in recent_dl],
         'is_corp_plan':     _has_team_access(u),
         'is_team_member':   is_team_member,
         'team_owner_name':  team_owner_name,
+        'single_purchases_count': sp_count,
     })
 
 
@@ -7170,7 +7893,7 @@ def account_data():
             (u['id'],)
         ).fetchall()
         # Usage chart: downloads per day for last 30 days
-        thirty_ago = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d')
+        thirty_ago = (_now() - timedelta(days=30)).strftime('%Y-%m-%d')
         daily = c.execute(
             "SELECT DATE(ts) as d, COUNT(*) as n FROM downloads "
             "WHERE user_id=? AND ts >= ? GROUP BY DATE(ts) ORDER BY d",
@@ -7262,11 +7985,16 @@ def create_checkout(plan):
 
         base = os.environ.get('BASE_URL', 'https://consulta-rpp.javisnes.com')
 
+        today = _now().strftime('%Y-%m-%d')
+        uid_str = str(u['id'])
+        body_data = request.get_json(silent=True) or {}
+
         if plan == 'single':
             # Single download payment ($130 MXN)
-            return_folio = (request.get_json(silent=True) or {}).get('return_folio', '')
-            job_id = (request.get_json(silent=True) or {}).get('job_id', '')
+            return_folio = body_data.get('return_folio', '')
+            job_id = body_data.get('job_id', '')
             success_url  = f"{base}/subscription/success?single=1&folio={return_folio}&job_id={job_id}"
+            idem_key = f"single-{uid_str}-{job_id or return_folio}-{today}"
             checkout = _stripe.checkout.Session.create(
                 customer=customer_id,
                 payment_method_types=['card'],
@@ -7274,11 +8002,13 @@ def create_checkout(plan):
                 mode='payment',
                 success_url=success_url,
                 cancel_url=f"{base}/",
-                metadata={'user_id': str(u['id']), 'type': 'single', 'folio': return_folio, 'job_id': job_id},
+                metadata={'user_id': uid_str, 'type': 'single', 'folio': return_folio, 'job_id': job_id},
+                idempotency_key=idem_key,
             )
         elif plan in ('pack5', 'pack10'):
             pack = PACK_CONFIG[plan]
             success_url = f"{base}/subscription/success?pack={plan}"
+            idem_key = f"pack-{uid_str}-{plan}-{today}"
             checkout = _stripe.checkout.Session.create(
                 customer=customer_id,
                 payment_method_types=['card'],
@@ -7286,12 +8016,14 @@ def create_checkout(plan):
                 mode='payment',
                 success_url=success_url,
                 cancel_url=f"{base}/pricing",
-                metadata={'user_id': str(u['id']), 'type': plan, 'credits': str(pack['qty'])},
+                metadata={'user_id': uid_str, 'type': plan, 'credits': str(pack['qty'])},
+                idempotency_key=idem_key,
             )
         elif plan == 'extra':
             # One-time payment
-            return_folio = (request.get_json(silent=True) or {}).get('return_folio', '')
+            return_folio = body_data.get('return_folio', '')
             success_url  = f"{base}/subscription/success?extra=1&folio={return_folio}"
+            idem_key = f"extra-{uid_str}-{today}"
             checkout = _stripe.checkout.Session.create(
                 customer=customer_id,
                 payment_method_types=['card'],
@@ -7299,10 +8031,12 @@ def create_checkout(plan):
                 mode='payment',
                 success_url=success_url,
                 cancel_url=f"{base}/pricing",
-                metadata={'user_id': str(u['id']), 'type': 'extra'},
+                metadata={'user_id': uid_str, 'type': 'extra', 'folio': return_folio},
+                idempotency_key=idem_key,
             )
         else:
             # Subscription
+            idem_key = f"sub-{uid_str}-{plan}-{today}"
             checkout = _stripe.checkout.Session.create(
                 customer=customer_id,
                 payment_method_types=['card'],
@@ -7310,7 +8044,8 @@ def create_checkout(plan):
                 mode='subscription',
                 success_url=f"{base}/subscription/success?plan={plan}",
                 cancel_url=f"{base}/pricing",
-                metadata={'user_id': str(u['id']), 'plan': plan},
+                metadata={'user_id': uid_str, 'plan': plan},
+                idempotency_key=idem_key,
             )
         return jsonify({'url': checkout.url})
     except _stripe.error.StripeError as e:
@@ -7481,48 +8216,54 @@ def portal():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    import datetime as _dt
     u = current_user()
     if u['role'] == 'admin':
         return redirect('/admin')
     if u.get('sub_status') != 'active' or u.get('billing_interval') != 'year':
         return redirect('/pricing')
 
-    selected_year  = int(request.args.get('year',  _dt.datetime.utcnow().year))
+    selected_year  = int(request.args.get('year',  _now().year))
     selected_month = int(request.args.get('month', 0))
 
     period_start = u.get('period_start') or '1970-01-01'
     plan         = u.get('plan') or 'basico'
     annual_quota = ANNUAL_QUOTAS.get(plan, 60)
 
+    # Include team members in all queries
+    member_ids   = get_team_member_ids(u['id'])
+    all_ids      = [u['id']] + member_ids
+    ph           = ','.join('?' * len(all_ids))   # e.g. "?,?,?"
+
     with _db() as c:
-        # Total used since period_start (annual counter)
+        # Total used since period_start (annual counter) — whole team
         annual_used = c.execute(
-            'SELECT COUNT(*) FROM downloads WHERE user_id=? AND ts >= ?',
-            (u['id'], period_start)
+            f'SELECT COUNT(*) FROM downloads WHERE user_id IN ({ph}) AND ts >= ?',
+            all_ids + [period_start]
         ).fetchone()[0]
 
-        # Monthly counts for selected year
+        # Monthly counts for selected year — whole team
         rows = c.execute(
-            "SELECT strftime('%m', ts) as m, COUNT(*) as n FROM downloads "
-            "WHERE user_id=? AND strftime('%Y', ts)=? GROUP BY m",
-            (u['id'], str(selected_year))
+            f"SELECT strftime('%m', ts) as m, COUNT(*) as n FROM downloads "
+            f"WHERE user_id IN ({ph}) AND strftime('%Y', ts)=? GROUP BY m",
+            all_ids + [str(selected_year)]
         ).fetchall()
         monthly_counts = {r['m']: r['n'] for r in rows}
 
-        # History — filtered by year + optional month
+        # History — filtered by year + optional month, with member name
         if selected_month > 0:
             month_str = f'{selected_year}-{str(selected_month).zfill(2)}'
             history = c.execute(
-                "SELECT folio_real, nombre, ts FROM downloads "
-                "WHERE user_id=? AND strftime('%Y-%m', ts)=? ORDER BY ts DESC",
-                (u['id'], month_str)
+                f"SELECT d.folio_real, d.nombre, d.ts, u2.name as quien "
+                f"FROM downloads d LEFT JOIN users u2 ON u2.id=d.user_id "
+                f"WHERE d.user_id IN ({ph}) AND strftime('%Y-%m', d.ts)=? ORDER BY d.ts DESC",
+                all_ids + [month_str]
             ).fetchall()
         else:
             history = c.execute(
-                "SELECT folio_real, nombre, ts FROM downloads "
-                "WHERE user_id=? AND strftime('%Y', ts)=? ORDER BY ts DESC",
-                (u['id'], str(selected_year))
+                f"SELECT d.folio_real, d.nombre, d.ts, u2.name as quien "
+                f"FROM downloads d LEFT JOIN users u2 ON u2.id=d.user_id "
+                f"WHERE d.user_id IN ({ph}) AND strftime('%Y', d.ts)=? ORDER BY d.ts DESC",
+                all_ids + [str(selected_year)]
             ).fetchall()
 
     dl = get_dl_info(u)
@@ -7534,39 +8275,45 @@ def dashboard():
 @app.route('/dashboard/report')
 @login_required
 def dashboard_report():
-    import datetime as _dt, csv, io as _io
+    import csv, io as _io
     u = current_user()
     if u['role'] == 'admin':
         return redirect('/admin')
     if u.get('sub_status') != 'active' or u.get('billing_interval') != 'year':
         return redirect('/pricing')
 
-    selected_year  = int(request.args.get('year',  _dt.datetime.utcnow().year))
+    selected_year  = int(request.args.get('year',  _now().year))
     selected_month = int(request.args.get('month', 0))
+
+    member_ids = get_team_member_ids(u['id'])
+    all_ids    = [u['id']] + member_ids
+    ph         = ','.join('?' * len(all_ids))
 
     with _db() as c:
         if selected_month > 0:
             month_str = f'{selected_year}-{str(selected_month).zfill(2)}'
             rows = c.execute(
-                "SELECT folio_real, nombre, ts FROM downloads "
-                "WHERE user_id=? AND strftime('%Y-%m', ts)=? ORDER BY ts",
-                (u['id'], month_str)
+                f"SELECT d.folio_real, d.nombre, d.ts, u2.name as quien "
+                f"FROM downloads d LEFT JOIN users u2 ON u2.id=d.user_id "
+                f"WHERE d.user_id IN ({ph}) AND strftime('%Y-%m', d.ts)=? ORDER BY d.ts",
+                all_ids + [month_str]
             ).fetchall()
             fname = f'reporte_{selected_year}_{str(selected_month).zfill(2)}.csv'
         else:
             rows = c.execute(
-                "SELECT folio_real, nombre, ts FROM downloads "
-                "WHERE user_id=? AND strftime('%Y', ts)=? ORDER BY ts",
-                (u['id'], str(selected_year))
+                f"SELECT d.folio_real, d.nombre, d.ts, u2.name as quien "
+                f"FROM downloads d LEFT JOIN users u2 ON u2.id=d.user_id "
+                f"WHERE d.user_id IN ({ph}) AND strftime('%Y', d.ts)=? ORDER BY d.ts",
+                all_ids + [str(selected_year)]
             ).fetchall()
             fname = f'reporte_{selected_year}.csv'
 
     buf = _io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(['Fecha', 'Hora', 'Folio Real', 'Propietario'])
+    writer.writerow(['Fecha', 'Hora', 'Folio Real', 'Propietario', 'Usuario'])
     for r in rows:
         ts = r['ts'] or ''
-        writer.writerow([ts[:10], ts[11:16], r['folio_real'] or '', r['nombre'] or ''])
+        writer.writerow([ts[:10], ts[11:16], r['folio_real'] or '', r['nombre'] or '', r['quien'] or ''])
 
     out = _io.BytesIO(buf.getvalue().encode('utf-8-sig'))
     return send_file(out, mimetype='text/csv', as_attachment=True, download_name=fname)
@@ -7639,7 +8386,7 @@ def equipo_invite():
         # Check if user exists, link immediately if so
         member_user = c.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone()
         member_id   = member_user['id'] if member_user else None
-        joined_at   = datetime.utcnow().isoformat() if member_id else None
+        joined_at   = _now().isoformat() if member_id else None
         c.execute('INSERT INTO corporate_members(owner_id, invite_email, member_id, joined_at) VALUES(?,?,?,?)',
                   (u['id'], email, member_id, joined_at))
 
@@ -8090,7 +8837,8 @@ def stripe_webhook():
     import json as _json
     data     = _json.loads(payload)['data']['object']
 
-    if evt_type == 'checkout.session.completed':
+    def _dispatch():
+      if evt_type == 'checkout.session.completed':
         uid  = int(data.get('metadata', {}).get('user_id', 0))
         kind = data.get('metadata', {}).get('type', '')
         if not uid:
@@ -8103,42 +8851,56 @@ def stripe_webhook():
             with _db() as c:
                 c.execute('INSERT OR IGNORE INTO single_purchases(user_id,folio_real,payment_intent) VALUES(?,?,?)',
                           (uid, folio, pi))
-                # Always give 1 extra_credit so user can download even if job is gone
                 existing = c.execute('SELECT id FROM extra_credits WHERE payment_intent=?', (pi,)).fetchone()
                 if not existing:
                     c.execute('INSERT INTO extra_credits(user_id,payment_intent) VALUES(?,?)', (uid, pi))
+                u_row = c.execute('SELECT email,name FROM users WHERE id=?', (uid,)).fetchone()
             if job_id and _job_get(job_id):
                 _job_set(job_id, {'pay_per_download': False, 'single_paid': True})
-            # Send receipt email
-            with _db() as c:
-                u_row = c.execute('SELECT email,name FROM users WHERE id=?', (uid,)).fetchone()
             if u_row:
-                threading.Thread(
-                    target=send_receipt_email,
-                    args=(u_row['email'], u_row['name'] or '', folio),
-                    daemon=True
-                ).start()
+                threading.Thread(target=send_receipt_email,
+                    args=(u_row['email'], u_row['name'] or '', folio), daemon=True).start()
+                _notify_admin_payment(u_row['name'] or u_row['email'], u_row['email'],
+                    'single', f'Folio {folio}', 130)
+                # Conversion email on 2nd or 3rd purchase (not subscribed)
+                with _db() as _cc:
+                    _purchase_count = _cc.execute(
+                        'SELECT COUNT(*) FROM single_purchases WHERE user_id=?', (uid,)
+                    ).fetchone()[0]
+                    _sub_status = _cc.execute(
+                        'SELECT sub_status FROM users WHERE id=?', (uid,)
+                    ).fetchone()[0]
+                if _purchase_count in (2, 3) and _sub_status != 'active':
+                    threading.Thread(target=send_conversion_email,
+                        args=(u_row['email'], u_row['name'] or '', _purchase_count, _purchase_count * 130),
+                        daemon=True).start()
         elif kind in ('pack5', 'pack10'):
             pi = data.get('payment_intent', '')
             credits = int(data.get('metadata', {}).get('credits', PACK_CONFIG.get(kind, {}).get('qty', 5)))
+            monto = 550 if kind == 'pack5' else 990
             with _db() as c:
-                c.execute('INSERT INTO download_packs(user_id,pack_type,credits_total,payment_intent) VALUES(?,?,?,?)',
-                          (uid, kind, credits, pi))
-            # Send receipt
+                inserted = c.execute('INSERT OR IGNORE INTO download_packs(user_id,pack_type,credits_total,payment_intent) VALUES(?,?,?,?)',
+                          (uid, kind, credits, pi)).rowcount
+                u_row = c.execute('SELECT email,name FROM users WHERE id=?', (uid,)).fetchone()
+            if u_row and inserted:  # only notify on first insert, not retries
+                threading.Thread(target=send_pack_email,
+                    args=(u_row['email'], u_row['name'] or '', kind, credits), daemon=True).start()
+                _notify_admin_payment(u_row['name'] or u_row['email'], u_row['email'],
+                    kind, f'{credits} créditos', monto)
+        elif kind == 'extra':
+            # Add 1 extra download credit — also register in single_purchases
+            pi = data.get('payment_intent', '')
+            folio = data.get('metadata', {}).get('folio', '')
             with _db() as c:
+                c.execute('INSERT OR IGNORE INTO single_purchases(user_id,folio_real,payment_intent) VALUES(?,?,?)',
+                          (uid, folio, pi))
+                existing = c.execute('SELECT id FROM extra_credits WHERE payment_intent=?', (pi,)).fetchone()
+                if not existing:
+                    c.execute('INSERT INTO extra_credits(user_id,payment_intent) VALUES(?,?)', (uid, pi))
                 u_row = c.execute('SELECT email,name FROM users WHERE id=?', (uid,)).fetchone()
             if u_row:
-                threading.Thread(
-                    target=send_pack_email,
-                    args=(u_row['email'], u_row['name'] or '', kind, credits),
-                    daemon=True
-                ).start()
-        elif kind == 'extra':
-            # Add 1 extra download credit
-            pi = data.get('payment_intent', '')
-            with _db() as c:
-                c.execute('INSERT INTO extra_credits(user_id,payment_intent) VALUES(?,?)',
-                          (uid, pi))
+                _notify_admin_payment(u_row['name'] or u_row['email'], u_row['email'],
+                    'extra', f'Folio {folio or "—"}', 130)
         else:
             plan_raw = data.get('metadata', {}).get('plan', '')
             # Detect billing interval before normalising
@@ -8150,26 +8912,58 @@ def stripe_webhook():
                 with _db() as c:
                     c.execute("""UPDATE users SET plan=?,stripe_sub_id=?,sub_status='active',
                                   downloads_used=0,period_start=?,billing_interval=?,annual_reminder_sent=NULL WHERE id=?""",
-                              (plan, sub_id, datetime.utcnow().isoformat(), billing_interval, uid))
+                              (plan, sub_id, _now().isoformat(), billing_interval, uid))
                     user_row = c.execute('SELECT email,name FROM users WHERE id=?', (uid,)).fetchone()
+                    # Grant referral bonuses now that referred user subscribed (anti-abuse: defer from signup)
+                    ref_use = c.execute(
+                        'SELECT ru.code, rc.user_id as referrer_id FROM referral_uses ru '
+                        'JOIN referral_codes rc ON rc.code=ru.code '
+                        'WHERE ru.referred_user_id=? AND ru.bonus_given=0', (uid,)
+                    ).fetchone()
+                    if ref_use:
+                        referrer_id = ref_use['referrer_id']
+                        # Cap: referrer can earn at most REFERRAL_MAX_CREDITS total
+                        referrer_earned = c.execute(
+                            "SELECT COUNT(*) as n FROM extra_credits WHERE user_id=? AND payment_intent LIKE 'referral_%'",
+                            (referrer_id,)
+                        ).fetchone()['n']
+                        if referrer_earned < REFERRAL_MAX_CREDITS:
+                            c.execute('INSERT INTO extra_credits(user_id,payment_intent) VALUES(?,?)',
+                                      (referrer_id, f'referral_{uid}'))
+                        # Referred user also gets a bonus download on top of their plan
+                        if not c.execute('SELECT id FROM extra_credits WHERE payment_intent=?',
+                                         (f'referral_bonus_{ref_use["code"]}_{uid}',)).fetchone():
+                            c.execute('INSERT INTO extra_credits(user_id,payment_intent) VALUES(?,?)',
+                                      (uid, f'referral_bonus_{ref_use["code"]}_{uid}'))
+                        c.execute('UPDATE referral_uses SET bonus_given=1 WHERE referred_user_id=?', (uid,))
                 if user_row:
                     threading.Thread(
                         target=send_welcome_email,
                         args=(user_row['email'], user_row['name'] or '', plan),
                         daemon=True
                     ).start()
+                    precios = {'basico': 500, 'pro': 1000, 'empresarial': 2000,
+                               'corporativo': 5000, 'corporativo_pro': 8000}
+                    monto_sub = precios.get(plan, 0)
+                    if billing_interval == 'year': monto_sub *= 10
+                    _notify_admin_payment(
+                        user_row['name'] or user_row['email'], user_row['email'],
+                        'sub', f'Plan {plan} {"anual" if billing_interval=="year" else "mensual"}',
+                        monto_sub)
                 # Sync to Notion after plan activation
                 with _db() as c:
                     full_row = c.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
                 if full_row:
                     notion_sync_user_async(full_row)
 
-    elif evt_type == 'customer.subscription.updated':
+      elif evt_type == 'customer.subscription.updated':
+        # Only update plan/status — do NOT reset downloads here.
+        # Downloads reset is handled by invoice.paid (subscription_cycle) to avoid
+        # false resets on card updates, metadata changes, etc.
         sub_id = data['id']
         status = data['status']
         plan   = None
-        # Extract plan from items
-        items = data.get('items', {}).get('data', [])
+        items  = data.get('items', {}).get('data', [])
         for item in items:
             price_id = item.get('price', {}).get('id', '')
             for k, v in STRIPE_PRICE.items():
@@ -8185,19 +8979,33 @@ def stripe_webhook():
             else:
                 c.execute("UPDATE users SET sub_status=? WHERE stripe_sub_id=?",
                           (status, sub_id))
-        # Reset downloads on renewal (status=active and period reset)
-        if status == 'active':
-            with _db() as c:
-                c.execute("""UPDATE users SET downloads_used=0,period_start=?
-                             WHERE stripe_sub_id=?""",
-                          (datetime.utcnow().isoformat(), sub_id))
-        # Notion sync
-        with _db() as c:
             u_row = c.execute('SELECT * FROM users WHERE stripe_sub_id=?', (sub_id,)).fetchone()
         if u_row:
             notion_sync_user_async(u_row)
 
-    elif evt_type == 'customer.subscription.deleted':
+      elif evt_type == 'invoice.paid':
+        # Fires on every successful payment — filter to subscription renewals only
+        billing_reason = data.get('billing_reason', '')
+        sub_id = data.get('subscription', '')
+        if sub_id and billing_reason == 'subscription_cycle':
+            # Genuine monthly/annual renewal → rollover unused downloads
+            period_start = _now().isoformat()
+            with _db() as c:
+                u_row = c.execute('SELECT * FROM users WHERE stripe_sub_id=?', (sub_id,)).fetchone()
+                if u_row:
+                    plan_limit = PLAN_LIMITS.get(u_row['plan'] or '', 0)
+                    used = u_row['downloads_used'] or 0
+                    new_used = min(0, used - plan_limit)  # negative = banked rollover
+                    c.execute("""UPDATE users SET downloads_used=?, period_start=?
+                                 WHERE stripe_sub_id=?""",
+                              (new_used, period_start, sub_id))
+                    u_row = c.execute('SELECT * FROM users WHERE stripe_sub_id=?', (sub_id,)).fetchone()
+            if u_row:
+                notion_sync_user_async(u_row)
+                rollover = abs(min(0, (u_row['downloads_used'] or 0)))
+                print(f'[RENEWAL] uid={u_row["id"]} plan={u_row["plan"]} rollover={rollover}', flush=True)
+
+      elif evt_type == 'customer.subscription.deleted':
         sub_id = data['id']
         with _db() as c:
             c.execute("UPDATE users SET sub_status='canceled',plan=NULL WHERE stripe_sub_id=?",
@@ -8206,7 +9014,7 @@ def stripe_webhook():
         if u_row:
             notion_sync_user_async(u_row)
 
-    elif evt_type == 'invoice.payment_failed':
+      elif evt_type == 'invoice.payment_failed':
         sub_id = data.get('subscription', '')
         if sub_id:
             with _db() as c:
@@ -8220,6 +9028,13 @@ def stripe_webhook():
                                  args=(u_row['email'], u_row['name'], plan_label),
                                  daemon=True).start()
 
+    try:
+        _dispatch()
+    except Exception as _wh_err:
+        import traceback
+        print(f'[WEBHOOK ERROR] evt={evt_type} err={_wh_err}\n{traceback.format_exc()}', flush=True)
+        return f'webhook error: {_wh_err}', 500  # 5xx → Stripe reintenta automáticamente
+
     return 'ok', 200
 
 
@@ -8229,7 +9044,7 @@ def admin_panel():
     u = current_user()
     if u['role'] != 'admin':
         return redirect(url_for('index'))
-    now = datetime.utcnow()
+    now = _now()
     month_start = now.replace(day=1).strftime('%Y-%m-%d')
     with _db() as c:
         users = c.execute('SELECT * FROM users ORDER BY created_at DESC').fetchall()
@@ -8243,6 +9058,23 @@ def admin_panel():
         churn_rows = c.execute(
             "SELECT name, email, plan, sub_status, period_start FROM users WHERE sub_status IN ('canceled','past_due') ORDER BY period_start DESC"
         ).fetchall()
+        # Active trials with days remaining
+        trial_rows = c.execute(
+            "SELECT id, name, email, trial_ends FROM users "
+            "WHERE trial_ends > ? AND (sub_status IS NULL OR sub_status != 'active') AND role != 'admin' "
+            "ORDER BY trial_ends ASC",
+            (now.isoformat(),)
+        ).fetchall()
+        # New signups per day last 14 days
+        reg_per_day = c.execute(
+            "SELECT date(created_at) as d, COUNT(*) as cnt FROM users "
+            "WHERE created_at >= date('now','-14 days') GROUP BY date(created_at) ORDER BY d"
+        ).fetchall()
+        # Active users last 7 days (had any analytics event)
+        active_7d = c.execute(
+            "SELECT COUNT(DISTINCT user_id) as n FROM analytics_events "
+            "WHERE ts >= date('now','-7 days') AND user_id IS NOT NULL"
+        ).fetchone()['n']
         # One-time purchase revenue this month
         single_rev_month = c.execute(
             "SELECT COALESCE(SUM(amount),0) FROM single_purchases WHERE ts >= ?", (month_start,)
@@ -8306,26 +9138,43 @@ def admin_panel():
     mrr = sum(PLAN_PRICES.get(r['plan'], 0) for r in users_list if r.get('sub_status') == 'active')
     total_non_admin = sum(1 for r in users_list if r.get('role') != 'admin')
     conversion = (active_subs / total_non_admin * 100) if total_non_admin else 0
-    # Total revenue: Stripe invoices paid + one-time from DB
+    # Total revenue: Stripe invoices paid (real) + one-time from DB
     stripe_total = 0
+    stripe_ok = False
     try:
         if _stripe.api_key:
             for inv in _stripe.Invoice.list(status='paid', limit=100).auto_paging_iter():
                 stripe_total += (inv.amount_paid or 0)
             stripe_total = int(stripe_total / 100)  # centavos → MXN
+            stripe_ok = True
     except Exception:
         pass
-    total_revenue = stripe_total + onetime_rev_total if stripe_total else (mrr + onetime_rev_total)
-    dl_chart = [{'date': r['d'], 'count': r['cnt']} for r in dl_per_day]
+    # Real revenue = Stripe + one-time purchases. MRR is always the estimate from plan prices.
+    real_revenue = stripe_total + onetime_rev_total
+    dl_chart   = [{'date': r['d'], 'count': r['cnt']} for r in dl_per_day]
+    reg_chart  = [{'date': r['d'], 'count': r['cnt']} for r in reg_per_day]
     churn_alerts = [{'name': r['name'], 'email': r['email'], 'plan': PLAN_LABELS.get(r['plan'], r['plan'] or ''), 'status': r['sub_status'], 'date': (r['period_start'] or '')[:10]} for r in churn_rows]
+    # Trials list with days remaining
+    trials_list = []
+    for r in trial_rows:
+        try:
+            from datetime import datetime as _dt
+            te = _dt.fromisoformat(r['trial_ends'])
+            days_left = max(0, (te - now).days)
+        except Exception:
+            days_left = '?'
+        trials_list.append({'id': r['id'], 'name': r['name'] or r['email'], 'email': r['email'], 'days_left': days_left, 'trial_ends': (r['trial_ends'] or '')[:10]})
     metrics = {
         'total_users': len(users_list), 'active_subs': active_subs,
         'total_downloads': total_dl, 'downloads_this_month': dl_month,
         'onetime_rev_month': onetime_rev_month,
-        'total_revenue': total_revenue,
+        'real_revenue': real_revenue, 'stripe_ok': stripe_ok,
         'mrr': mrr, 'trial_users': trial_users, 'canceled': canceled,
         'conversion_rate': conversion, 'dl_per_day': dl_chart,
+        'reg_per_day': reg_chart,
         'churn_alerts': churn_alerts,
+        'trials_list': trials_list,
+        'active_7d': active_7d,
     }
     return render_admin(users_list, metrics)
 
@@ -8372,7 +9221,7 @@ def index():
         trial_badge = ''
         if in_trial:
             try:
-                days_left = max(0, (datetime.fromisoformat(u['trial_ends']) - datetime.utcnow()).days)
+                days_left = max(0, (datetime.fromisoformat(u['trial_ends']) - _now()).days)
             except Exception:
                 days_left = 0
             trial_badge = f'<span class="badge" style="background:#f59e0b;color:#000;font-size:.65rem">Trial {days_left}d</span>'
@@ -8432,20 +9281,36 @@ def buscar():
     is_team_member = bool(get_corporate_owner_id(u['id']))
     has_sub  = is_admin or u.get('sub_status') == 'active' or u.get('in_trial') or is_team_member
 
-    # Subscribed users: check quota
-    if has_sub:
-        dl = get_dl_info(u)
-        if dl['left'] <= 0:
-            return jsonify({'error': 'Límite de descargas alcanzado', 'quota': True,
-                            'folio': folio}), 402
-        use_extra = dl['use_extra']
-        use_pack  = dl['use_pack']
-    else:
-        # Free user: check for pack credits first
-        with _db() as c:
-            pack_credits = _get_pack_credits(c, u['id'])
+    # Check if user already purchased this folio — re-download is free
+    with _db() as c:
+        already_purchased = c.execute(
+            'SELECT id FROM single_purchases WHERE user_id=? AND folio_real=?',
+            (u['id'], folio)).fetchone()
+
+    if already_purchased:
         use_extra = False
-        use_pack  = pack_credits > 0
+        use_pack  = False
+        redownload = True
+    else:
+        redownload = False
+        # Subscribed users: check quota
+        if has_sub:
+            dl = get_dl_info(u)
+            if dl['left'] <= 0:
+                msg = 'El trial no incluye descargas — suscríbete para descargar' if u.get('in_trial') else 'Límite de descargas alcanzado'
+                return jsonify({'error': msg, 'quota': True, 'folio': folio, 'goto': '/pricing'}), 402
+            use_extra = dl['use_extra']
+            use_pack  = dl['use_pack']
+        else:
+            # Free user: check pack credits and single-purchase extra credits
+            with _db() as c:
+                pack_credits = _get_pack_credits(c, u['id'])
+                extra_single = c.execute(
+                    'SELECT COUNT(*) as n FROM extra_credits WHERE user_id=? AND used=0',
+                    (u['id'],)).fetchone()['n']
+            use_pack  = pack_credits > 0
+            use_extra = not use_pack and extra_single > 0
+            # Si no tiene créditos, puede buscar igual — pagará al descargar ($130 MXN)
 
     _cleanup_old_jobs()
     job_id = str(uuid.uuid4())
@@ -8453,13 +9318,18 @@ def buscar():
         'status': 'running', 'pdf': None, 'error': None,
         'type': 'folio', 'folio': folio, 'ts': time.time(),
         'user_id': u['id'], 'use_extra': use_extra, 'use_pack': use_pack,
-        'pay_per_download': not has_sub and not use_pack,
+        'redownload': redownload,
+        'pay_per_download': not has_sub and not use_pack and not redownload,
         'nombre_prop': nombre_prop,
     })
 
     # Track abandoned cart for free users
     if not has_sub and not use_pack:
         _track_abandoned_search(u['id'], folio)
+
+    # Track first-search follow-up for users without active plan
+    if u.get('role') != 'admin' and u.get('sub_status') != 'active':
+        threading.Thread(target=_track_no_plan_search, args=(u['id'],), daemon=True).start()
 
     # Track search event + audit
     threading.Thread(target=_track, args=('search_folio', u['id'], u.get('plan'), folio), daemon=True).start()
@@ -8506,6 +9376,10 @@ def buscar_nombre():
     meta_nombre = ' '.join(filter(None, [paterno, materno, nombre]))[:100]
     threading.Thread(target=_track, args=('search_nombre', u['id'], u.get('plan'), meta_nombre), daemon=True).start()
 
+    # Track first-search follow-up for users without active plan
+    if u.get('role') != 'admin' and u.get('sub_status') != 'active':
+        threading.Thread(target=_track_no_plan_search, args=(u['id'],), daemon=True).start()
+
     _cleanup_old_jobs()
     job_id = str(uuid.uuid4())
     _job_create(job_id, {'status': 'running', 'results': None, 'error': None,
@@ -8526,6 +9400,12 @@ def buscar_nombre():
     return jsonify({'job_id': job_id})
 
 
+def _censor_name(s):
+    """Show first letter + asterisks: 'García' → 'G*****'"""
+    if not s:
+        return s
+    return s[0] + '*' * (len(s) - 1)
+
 @app.route('/status/<job_id>')
 def job_status(job_id):
     job = _job_get(job_id)
@@ -8535,7 +9415,19 @@ def job_status(job_id):
         return jsonify({'status': 'error', 'error': job['error']})
     if job['status'] == 'done':
         if job.get('type') == 'nombre':
-            return jsonify({'status': 'done', 'results': job['results']})
+            u = current_user()
+            in_trial = u and u.get('in_trial') and u.get('sub_status') != 'active'
+            results = job['results']
+            if in_trial:
+                # Censor owner names — require subscription to see full data
+                import copy
+                results = copy.deepcopy(results)
+                for r in results:
+                    p = r.get('propietario', {})
+                    p['nombre']  = _censor_name(p.get('nombre', ''))
+                    p['paterno'] = _censor_name(p.get('paterno', ''))
+                    p['materno'] = _censor_name(p.get('materno', ''))
+            return jsonify({'status': 'done', 'results': results, 'censored': bool(in_trial)})
         if job.get('type') == 'sat':
             return jsonify({'status': 'done', 'result': job['result']})
         return jsonify({'status': 'done', 'has_inscripcion': bool(job.get('inscripcion_pdf'))})
@@ -8588,7 +9480,8 @@ def buscar_lote():
 
     dl = get_dl_info(u)
     if u['role'] != 'admin' and dl['left'] <= 0:
-        return jsonify({'error': 'Límite de descargas alcanzado', 'quota': True}), 402
+        msg = 'El trial no incluye descargas — suscríbete para descargar' if u.get('in_trial') else 'Límite de descargas alcanzado'
+        return jsonify({'error': msg, 'quota': True, 'goto': '/pricing'}), 402
 
     _cleanup_old_jobs()
     jobs = []
@@ -8642,8 +9535,10 @@ def download(job_id):
     if job.get('pay_per_download') and not job.get('single_paid'):
         return jsonify({'error': 'Pago requerido', 'pay_required': True,
                         'folio': job.get('folio', '')}), 402
-    # Record the download
-    record_dl(job.get('user_id', u['id']), job.get('folio', ''), job.get('use_extra', False), job.get('use_pack', False), nombre=job.get('nombre_prop', ''))
+    # Record the download only once per job (prevent double-click double-charge)
+    if not job.get('downloaded'):
+        _job_set(job_id, {'downloaded': True})
+        record_dl(job.get('user_id', u['id']), job.get('folio', ''), job.get('use_extra', False), job.get('use_pack', False), nombre=job.get('nombre_prop', ''), redownload=job.get('redownload', False))
     # Track download event
     threading.Thread(target=_track, args=('download', u['id'], u.get('plan'), job.get('folio', '')), daemon=True).start()
     # Low-downloads warning email (only 1 left after this download)
@@ -8832,7 +9727,7 @@ def admin_grant_plan():
         if reset:
             c.execute('''UPDATE users SET plan=?, sub_status=?, billing_interval=?,
                          downloads_used=0, period_start=? WHERE id=?''',
-                      (plan, status, billing_interval, datetime.utcnow().isoformat(), uid))
+                      (plan, status, billing_interval, _now().isoformat(), uid))
         else:
             c.execute('UPDATE users SET plan=?, sub_status=?, billing_interval=? WHERE id=?',
                       (plan, status, billing_interval, uid))
@@ -8901,12 +9796,16 @@ def admin_user_detail(uid):
         prows = c.execute('SELECT credits_total, credits_used FROM download_packs WHERE user_id=?', (uid,)).fetchall()
         for p in prows:
             pack_credits += (p['credits_total'] - p['credits_used'])
+        extra_credits = c.execute(
+            'SELECT COUNT(*) as n FROM extra_credits WHERE user_id=? AND used=0', (uid,)
+        ).fetchone()['n']
     t = dict(target)
     return jsonify({
         'id': t['id'], 'name': t['name'], 'email': t['email'], 'plan': t['plan'],
         'sub_status': t['sub_status'], 'billing_interval': t.get('billing_interval'),
         'created_at': t['created_at'], 'trial_ends': t.get('trial_ends'),
         'downloads_used': t['downloads_used'], 'pack_credits': pack_credits,
+        'extra_credits': extra_credits,
         'stripe_customer_id': t.get('stripe_customer_id'),
         'stripe_sub_id': t.get('stripe_sub_id'),
         'downloads': [{'folio': d['folio_real'], 'nombre': d['nombre'], 'ts': d['ts']} for d in downloads],
@@ -8954,7 +9853,7 @@ def admin_user_dl_ranking():
     u = current_user()
     if u['role'] != 'admin':
         return jsonify({'error': 'No autorizado'}), 403
-    month_start = datetime.utcnow().replace(day=1).strftime('%Y-%m-%d')
+    month_start = _now().replace(day=1).strftime('%Y-%m-%d')
     with _db() as c:
         rows = c.execute(
             '''SELECT u.name, u.email, COUNT(*) as cnt
@@ -8981,7 +9880,7 @@ def admin_grant_credits():
             return jsonify({'error': 'Usuario no encontrado'}), 404
         c.execute(
             'INSERT INTO download_packs(user_id, pack_type, credits_total, credits_used, payment_intent, ts) VALUES(?,?,?,?,?,?)',
-            (uid, 'regalo_admin', qty, 0, 'admin_grant', datetime.utcnow().isoformat())
+            (uid, 'regalo_admin', qty, 0, 'admin_grant', _now().isoformat())
         )
     # Send notification email
     name = target['name'] or ''
@@ -9060,7 +9959,7 @@ def admin_send_mass_email():
             users = c.execute("SELECT email, name FROM users WHERE sub_status='active'").fetchall()
         elif target == 'trial':
             users = c.execute("SELECT email, name FROM users WHERE trial_ends > ? AND sub_status != 'active'",
-                            (datetime.utcnow().isoformat(),)).fetchall()
+                            (_now().isoformat(),)).fetchall()
         elif target == 'free':
             users = c.execute("SELECT email, name FROM users WHERE (sub_status IS NULL OR sub_status != 'active') AND role != 'admin'").fetchall()
         else:
@@ -9162,7 +10061,7 @@ def realtime_metrics():
     u = current_user()
     if u['role'] != 'admin':
         return jsonify({'error': 'Forbidden'}), 403
-    now = datetime.utcnow()
+    now = _now()
     hour_ago  = (now - timedelta(hours=1)).isoformat()[:19]
     day_ago   = (now - timedelta(days=1)).isoformat()[:19]
     month_start = now.replace(day=1).strftime('%Y-%m-%d')
@@ -9260,7 +10159,7 @@ def _stripe_mrr_history(months=12):
     if not _stripe.api_key:
         return None
     try:
-        now = datetime.utcnow()
+        now = _now()
         cutoff = int((now - timedelta(days=months * 31)).timestamp())
         history = {}
         for inv in _stripe.Invoice.list(status='paid', limit=100, created={'gte': cutoff}).auto_paging_iter():
@@ -9282,7 +10181,7 @@ def admin_dashboard_data():
     u = current_user()
     if u['role'] != 'admin':
         return jsonify({'error': 'Forbidden'}), 403
-    now = datetime.utcnow()
+    now = _now()
 
     # ── Stripe data (real) ────────────────────────────────────────────────────
     stripe_mrr     = _stripe_mrr_now()           # int MXN o None
@@ -9369,7 +10268,7 @@ def admin_ai_analysis():
     if not _ANTHROPIC_AVAILABLE:
         return jsonify({'error': 'Instala el paquete anthropic: pip install anthropic'}), 400
 
-    now = datetime.utcnow()
+    now = _now()
     month_start = now.replace(day=1).strftime('%Y-%m-%d')
     with _db() as c:
         total_users     = c.execute("SELECT COUNT(*) FROM users WHERE role != 'admin'").fetchone()[0]
@@ -9533,7 +10432,7 @@ def mis_referidos():
         <div style="text-align:center;padding:2.5rem 1rem;color:#555">
           <div style="font-size:2.5rem;margin-bottom:.75rem">🎁</div>
           <p style="font-size:.9rem;margin-bottom:.5rem">Aún no tienes referidos</p>
-          <p style="font-size:.78rem;color:#444">Comparte tu link y ambos reciben +1 descarga gratis</p>
+          <p style="font-size:.78rem;color:#444">Comparte tu link — cuando se suscriban, ambos reciben +1 descarga gratis</p>
         </div>'''
 
     page = f'''<!DOCTYPE html>
@@ -9577,7 +10476,7 @@ body.light .theme-btn{{background:#fff;border-color:#e0e0ee;color:#6366f1}}
 <div class="wrap">
   <a href="/" class="back">← Volver</a>
   <h1>🎁 Mis Referidos</h1>
-  <p class="subtitle">Comparte tu link y gana descargas gratis por cada persona que se registre</p>
+  <p class="subtitle">Comparte tu link — cuando tu referido se suscriba, ambos reciben 1 descarga gratis</p>
 
   <div class="stats">
     <div class="stat-card">
@@ -9596,14 +10495,14 @@ body.light .theme-btn{{background:#fff;border-color:#e0e0ee;color:#6366f1}}
 
   <div class="link-box">
     <div style="font-weight:700;font-size:.9rem">Tu link de referido</div>
-    <div style="font-size:.78rem;color:#666;margin-top:.2rem">Cada registro con tu link = +1 descarga gratis para ambos</div>
+    <div style="font-size:.78rem;color:#666;margin-top:.2rem">Cuando tu referido se suscriba = +1 descarga gratis para ambos</div>
     <div class="link-row">
       <input class="link-input" id="ref-link" value="{ref_link}" readonly onclick="this.select()">
       <button class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('ref-link').value);this.textContent='Copiado!';setTimeout(()=>this.textContent='Copiar',2000)">Copiar</button>
     </div>
     <div class="share-btns">
-      <a href="https://wa.me/?text=Consulta%20escrituras%20del%20RPP%20Chihuahua%20al%20instante.%20Reg%C3%ADstrate%20con%20mi%20link%20y%20ambos%20recibimos%20una%20descarga%20gratis%3A%20{ref_link}" target="_blank" class="share-btn share-wa">WhatsApp</a>
-      <a href="mailto:?subject=Consulta%20RPP%20Chihuahua&body=Hola!%20Te%20comparto%20esta%20herramienta%20para%20consultar%20escrituras%20del%20RPP.%20Si%20te%20registras%20con%20mi%20link%20ambos%20recibimos%20una%20descarga%20gratis%3A%20{ref_link}" class="share-btn share-email">Email</a>
+      <a href="https://wa.me/?text=Consulta%20escrituras%20del%20RPP%20Chihuahua%20al%20instante.%20Entra%20con%20mi%20link%2C%20suscr%C3%ADbete%20y%20ambos%20recibimos%20una%20descarga%20gratis%3A%20{ref_link}" target="_blank" class="share-btn share-wa">WhatsApp</a>
+      <a href="mailto:?subject=Consulta%20RPP%20Chihuahua&body=Hola!%20Te%20comparto%20esta%20herramienta%20para%20consultar%20escrituras%20del%20RPP.%20Entra%20con%20mi%20link%2C%20suscr%C3%ADbete%20y%20ambos%20recibimos%20una%20descarga%20gratis%3A%20{ref_link}" class="share-btn share-email">Email</a>
     </div>
   </div>
 
@@ -9627,6 +10526,86 @@ function toggleTheme() {{
 
 
 # ── Historial de consultas ───────────────────────────────────────────────────
+
+@app.route('/mis-escrituras')
+@login_required
+def mis_escrituras():
+    u = current_user()
+    with _db() as c:
+        rows = c.execute(
+            'SELECT folio_real, payment_intent, ts FROM single_purchases WHERE user_id=? ORDER BY ts DESC',
+            (u['id'],)
+        ).fetchall()
+    items_html = ''
+    for r in rows:
+        folio = r['folio_real'] or '—'
+        ts    = (r['ts'] or '')[:16].replace('T', ' ')
+        items_html += f'''
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;
+                    padding:.75rem 1rem;background:#0f0f1c;border:1px solid #1a1a2e;
+                    border-radius:10px;margin-bottom:.5rem;flex-wrap:wrap">
+          <div>
+            <div style="font-weight:700;color:#a78bfa;font-size:.95rem">Folio {folio}</div>
+            <div style="font-size:.75rem;color:#555;margin-top:.1rem">{ts} UTC · $130 MXN</div>
+          </div>
+          <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+            <button onclick="location.href='/?auto_folio={folio}'"
+              style="background:#2d1f5e;color:#a78bfa;border:1px solid #4c1d95;border-radius:6px;
+                     padding:.35rem .85rem;font-size:.8rem;cursor:pointer">
+              🔍 Buscar y descargar
+            </button>
+          </div>
+        </div>'''
+    if not rows:
+        items_html = '''<div style="text-align:center;padding:3rem 1rem;color:#555">
+          <div style="font-size:2.5rem;margin-bottom:.75rem">📄</div>
+          <p>Aún no tienes escrituras compradas.</p>
+          <a href="/" style="color:#a78bfa;font-size:.9rem">Buscar un folio →</a>
+        </div>'''
+    total_spent = len(rows) * 130
+    conversion_html = ''
+    if len(rows) >= 2 and u.get('sub_status') != 'active':
+        conversion_html = f'''
+        <div style="background:rgba(245,158,11,.1);border:1px solid #92400e;border-radius:10px;
+                    padding:1rem 1.25rem;margin-bottom:1.5rem">
+          <div style="font-weight:700;color:#fbbf24;margin-bottom:.3rem">
+            💡 Has gastado ${total_spent} MXN en escrituras individuales
+          </div>
+          <div style="color:#a16207;font-size:.875rem;margin-bottom:.75rem">
+            Con el Plan Básico ($500/mes) tienes 5 descargas + búsqueda por nombre de propietario.
+            Si descargas 4 o más escrituras al mes, la suscripción ya te sale más barato.
+          </div>
+          <a href="/pricing" style="display:inline-block;background:#f59e0b;color:#000;font-weight:700;
+             padding:.4rem 1rem;border-radius:6px;text-decoration:none;font-size:.85rem">
+            Ver planes →
+          </a>
+        </div>'''
+    page = f'''<!DOCTYPE html>
+<html lang="es"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mis Escrituras — Consulta RPP</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0d0d14;color:#dde0e8;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       min-height:100vh;padding:2rem 1rem 4rem}}
+  .wrap{{max-width:640px;margin:0 auto}}
+  h1{{font-size:1.4rem;font-weight:700;margin-bottom:.25rem}}
+  .subtitle{{color:#555;font-size:.875rem;margin-bottom:1.5rem}}
+  .back{{display:inline-flex;align-items:center;gap:.35rem;color:#a78bfa;text-decoration:none;
+         font-size:.85rem;margin-bottom:1.5rem}}
+  .back:hover{{color:#c4b5fd}}
+</style>
+</head><body>
+<div class="wrap">
+  <a href="/" class="back">← Volver al buscador</a>
+  <h1>📄 Mis Escrituras</h1>
+  <p class="subtitle">{len(rows)} escritura(s) comprada(s) · Re-descarga gratis en cualquier momento</p>
+  {conversion_html}
+  {items_html}
+</div>
+</body></html>'''
+    return page
+
 
 @app.route('/historial')
 @login_required
@@ -9652,7 +10631,7 @@ def historial():
         # Check if folio is in cache for re-download
         in_cache = folio in _pdf_cache and time.time() - _pdf_cache[folio]['ts'] < PDF_CACHE_TTL
         cache_badge = '<span style="color:#4ade80;font-size:.7rem;font-weight:600">● En cache</span>' if in_cache else ''
-        redownload_btn = f'<button onclick="redownloadFolio(\'{folio}\')" style="background:#1a1a2e;color:#8b9cf4;border:1px solid #2a2a4a;border-radius:6px;padding:.25rem .6rem;font-size:.72rem;cursor:pointer">🔄 Re-descargar</button>' if in_cache else f'<button onclick="redownloadFolio(\'{folio}\')" style="background:#1a1a2e;color:#666;border:1px solid #1a1a2a;border-radius:6px;padding:.25rem .6rem;font-size:.72rem;cursor:pointer" title="Buscar de nuevo (consume crédito)">🔍 Buscar</button>'
+        redownload_btn = f'<button onclick="redownloadFolio(\'{folio}\')" style="background:#1a1a2e;color:#8b9cf4;border:1px solid #2a2a4a;border-radius:6px;padding:.25rem .6rem;font-size:.72rem;cursor:pointer">🔄 Re-descargar</button>' if in_cache else f'<button onclick="redownloadFolio(\'{folio}\')" style="background:#1a1a2e;color:#666;border:1px solid #1a1a2a;border-radius:6px;padding:.25rem .6rem;font-size:.72rem;cursor:pointer" title="Buscar de nuevo — sin costo, ya está pagada">🔍 Buscar</button>'
         rows_html += f'''
         <div style="display:flex;align-items:center;justify-content:space-between;padding:.65rem .75rem;background:#0f0f1c;border:1px solid #1a1a2a;border-radius:10px;margin-bottom:.4rem">
           <div style="flex:1;min-width:0">
@@ -9760,7 +10739,7 @@ function filterHist() {{
 }}
 
 async function redownloadFolio(folio) {{
-  if (!confirm('Buscar folio ' + folio + '? Si no está en cache consumirá 1 crédito.')) return;
+  if (!confirm('Buscar y descargar folio ' + folio + '? Tu escritura ya está pagada — no se cobra crédito adicional.')) return;
   try {{
     const r = await fetch('/buscar', {{
       method: 'POST',
@@ -9949,7 +10928,7 @@ def send_abandoned_cart_emails():
     frm  = os.environ.get('SMTP_FROM', user)
     if not host or not user:
         return 0
-    cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    cutoff = (_now() - timedelta(hours=24)).isoformat()
     sent = 0
     with _db() as c:
         rows = c.execute("""
@@ -9957,7 +10936,7 @@ def send_abandoned_cart_emails():
             FROM abandoned_carts ac JOIN users u ON ac.user_id = u.id
             WHERE ac.emailed = 0 AND ac.ts <= ? AND ac.ts >= ?
             LIMIT 20
-        """, (cutoff, (datetime.utcnow() - timedelta(hours=48)).isoformat())).fetchall()
+        """, (cutoff, (_now() - timedelta(hours=48)).isoformat())).fetchall()
         for r in rows:
             body_html = f"""
 <div style="font-family:sans-serif;max-width:520px;margin:auto;background:#0d0d14;color:#dde0e8;padding:2rem;border-radius:12px">
@@ -9999,6 +10978,90 @@ def admin_send_abandoned():
     if u['role'] != 'admin':
         return jsonify({'error': 'No autorizado'}), 403
     sent = send_abandoned_cart_emails()
+    return jsonify({'sent': sent})
+
+
+# ── No-plan follow-up (24h personal email) ───────────────────────────────────
+
+def _track_no_plan_search(user_id):
+    """Record first search by a user without active plan. One record per user."""
+    try:
+        with _db() as c:
+            c.execute('INSERT OR IGNORE INTO no_plan_followup(user_id) VALUES(?)', (user_id,))
+    except Exception as e:
+        print(f'[FOLLOWUP] track error: {e}', flush=True)
+
+
+def send_no_plan_followup_emails(force=False):
+    """Send personal follow-up to users who searched without a plan.
+    force=True (manual from admin): sends to all pending regardless of time window,
+                                     and backfills users who searched but aren't in the table yet.
+    force=False (cron):             only sends to records 24-72h old.
+    """
+    sent = 0
+    with _db() as c:
+        if force:
+            # Backfill: insert any user who searched (analytics_events) but isn't in the table,
+            # and still has no active subscription
+            c.execute("""
+                INSERT OR IGNORE INTO no_plan_followup(user_id)
+                SELECT DISTINCT ae.user_id
+                FROM analytics_events ae
+                JOIN users u ON ae.user_id = u.id
+                WHERE ae.event IN ('search_folio','search_nombre')
+                  AND ae.user_id IS NOT NULL
+                  AND u.role != 'admin'
+                  AND (u.sub_status IS NULL OR u.sub_status != 'active')
+            """)
+            rows = c.execute("""
+                SELECT npf.id, npf.user_id, u.email, u.name
+                FROM no_plan_followup npf JOIN users u ON npf.user_id = u.id
+                WHERE npf.emailed = 0
+                  AND (u.sub_status IS NULL OR u.sub_status != 'active')
+                  AND u.role != 'admin'
+            """).fetchall()
+        else:
+            cutoff_hi = (_now() - timedelta(hours=24)).isoformat()
+            cutoff_lo = (_now() - timedelta(hours=72)).isoformat()
+            rows = c.execute("""
+                SELECT npf.id, npf.user_id, u.email, u.name
+                FROM no_plan_followup npf JOIN users u ON npf.user_id = u.id
+                WHERE npf.emailed = 0
+                  AND npf.ts <= ? AND npf.ts >= ?
+                  AND (u.sub_status IS NULL OR u.sub_status != 'active')
+                  AND u.role != 'admin'
+            """, (cutoff_hi, cutoff_lo)).fetchall()
+
+        for r in rows:
+            name = r['name'] or r['email'].split('@')[0]
+            body_html = (
+                '<div style="font-family:sans-serif;max-width:520px;margin:auto;color:#222;padding:1.5rem">'
+                '<p>Hola ' + name + ',</p>'
+                '<p>Vi que consultaste el RPP de Chihuahua en nuestro sistema. '
+                '\u00bfPudiste encontrar lo que buscabas?</p>'
+                '<p>Si tienes alguna duda de c\u00f3mo funciona, o si quieres explorar los planes '
+                'disponibles, con gusto te ayudo.</p>'
+                '<p>Puedes responder directo a este correo o entrar a tu cuenta en:<br>'
+                '<a href="https://consulta-rpp.javisnes.com">consulta-rpp.javisnes.com</a></p>'
+                '<p style="margin-top:1.5rem">Saludos,<br><strong>Javier</strong><br>'
+                '<span style="color:#888;font-size:.875rem">Consulta RPP Chihuahua</span></p>'
+                '</div>'
+            )
+            try:
+                _smtp_send(r['email'],
+                           '\u00bfTienes alguna duda del sistema? \u2014 Consulta RPP',
+                           body_html)
+                c.execute('UPDATE no_plan_followup SET emailed=1 WHERE id=?', (r['id'],))
+                sent += 1
+            except Exception as e:
+                print(f'[FOLLOWUP] email failed for {r["email"]}: {e}', flush=True)
+    return sent
+
+
+@app.route('/admin/send-no-plan-followups', methods=['POST'])
+def cron_no_plan_followups():
+    force = request.get_json(silent=True, force=True) or {}
+    sent = send_no_plan_followup_emails(force=bool(force.get('force')))
     return jsonify({'sent': sent})
 
 
@@ -10148,6 +11211,7 @@ def _fetch_gravamenes_inner(folio_real: str) -> list:
         browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
         context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
         page = context.new_page()
+        page.set_default_timeout(45000)
         _login_and_open_consulta(page)
         _rpp_pool_stats['logins'] += 1
         _rpp_login_time = time.time()
@@ -10187,7 +11251,7 @@ def _fetch_gravamenes_inner(folio_real: str) -> list:
                 return s.getRange(0, 100).map(r => {
                     const d = r.data;
                     return {
-                        fecha: d.FECHA_REGISTRO || '',
+                        fecha: (() => { const v = d.FECHA_REGISTRO; if (!v) return ''; if (v instanceof Date) return v.toISOString().slice(0,10); if (typeof v === 'number') return new Date(v).toISOString().slice(0,10); return String(v); })(),
                         acto: d.ACTO || '',
                         inscripcion: (d.INSCRIPCION || '').toString().trim(),
                         libro: (d.LIBRO || '').toString().trim(),
@@ -10196,7 +11260,8 @@ def _fetch_gravamenes_inner(folio_real: str) -> list:
                         partida: d.PARTIDA || '',
                         vigente: d.VIGENTE || '',
                         monto: d.MONTO || '',
-                        datosActo: (d.DATOSACTO || '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim()
+                        datosActo: (d.DATOSACTO || '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim(),
+                        tieneAgregado: d.TIENE_AGREGADO === 'S'
                     };
                 });
             })()
@@ -10216,6 +11281,7 @@ def _fetch_antecedentes_inner(folio_real: str) -> list:
         browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
         context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
         page = context.new_page()
+        page.set_default_timeout(45000)
         _login_and_open_consulta(page)
         _rpp_pool_stats['logins'] += 1
         _rpp_login_time = time.time()
@@ -10293,12 +11359,78 @@ _SAT_URL   = 'https://agsc.siat.sat.gob.mx/PTSC/ConsultaIdCSIAT/'
 # Set via env var SAT_PROXY on the server.  Leave blank = direct (will fail from US VPS).
 _SAT_PROXY = os.environ.get('SAT_PROXY', '')
 
+def _solve_captcha_local(img_b64: str) -> str:
+    """Solve simple text CAPTCHA locally using ddddocr (instant, free)."""
+    try:
+        import ddddocr, base64
+        ocr = ddddocr.DdddOcr(show_ad=False)
+        img_bytes = base64.b64decode(img_b64)
+        result = ocr.classification(img_bytes)
+        print(f'[CAPTCHA] local solved: {result}', flush=True)
+        return result.strip()
+    except Exception as e:
+        print(f'[CAPTCHA] local failed: {e}', flush=True)
+        raise
+
+
+def _solve_captcha_claude(img_b64: str) -> str:
+    """Use Claude Haiku vision to read a text captcha. Fast and accurate."""
+    import requests as _req
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY no configurada")
+    # Detect image type from base64 header
+    import base64 as _b64
+    raw = _b64.b64decode(img_b64[:16])
+    if raw[:4] == b'\x89PNG':
+        media_type = 'image/png'
+    elif raw[:2] == b'\xff\xd8':
+        media_type = 'image/jpeg'
+    else:
+        media_type = 'image/png'
+    r = _req.post(
+        'https://api.anthropic.com/v1/messages',
+        headers={
+            'x-api-key': api_key,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json',
+        },
+        json={
+            'model': 'claude-haiku-4-5-20251001',
+            'max_tokens': 20,
+            'messages': [{
+                'role': 'user',
+                'content': [
+                    {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type, 'data': img_b64}},
+                    {'type': 'text', 'text': 'This is a CAPTCHA. Reply with ONLY the characters shown, nothing else.'},
+                ]
+            }]
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
+    result = r.json()['content'][0]['text'].strip().replace(' ', '')
+    print(f'[CAPTCHA] claude solved: {result}', flush=True)
+    return result
+
+
 def _solve_captcha_2captcha(img_b64: str) -> str:
-    """Send base64 CAPTCHA image to 2captcha and return solved text."""
+    """Solve CAPTCHA: tries Claude vision first, then ddddocr, then 2captcha API."""
+    # ── Try Claude vision first (most accurate) ───────────────────────────────
+    try:
+        return _solve_captcha_claude(img_b64)
+    except Exception as _ce:
+        print(f'[CAPTCHA] claude failed ({_ce}), trying ddddocr', flush=True)
+    # ── Try local ddddocr ─────────────────────────────────────────────────────
+    try:
+        return _solve_captcha_local(img_b64)
+    except Exception:
+        pass
+
+    # ── Fallback: 2captcha API ────────────────────────────────────────────────
     import requests as _req
     if not TWOCAPTCHA_KEY:
         raise ValueError("Clave de 2captcha no configurada (TWOCAPTCHA_KEY)")
-    # Submit task
     r = _req.post('https://2captcha.com/in.php', data={
         'key': TWOCAPTCHA_KEY, 'method': 'base64', 'body': img_b64,
         'json': 1, 'numeric': 0, 'min_len': 4, 'max_len': 6,
@@ -10308,56 +11440,184 @@ def _solve_captcha_2captcha(img_b64: str) -> str:
     if d.get('status') != 1:
         raise ValueError(f"2captcha envío error: {d.get('request')}")
     task_id = d['request']
-    # Wait 5s before first poll (typical minimum solve time)
-    time.sleep(5)
-    # Poll every 1.5s for up to 40 seconds total
-    for _ in range(24):
+    time.sleep(2)
+    for _ in range(60):
         r = _req.get('https://2captcha.com/res.php', params={
             'key': TWOCAPTCHA_KEY, 'action': 'get', 'id': task_id, 'json': 1,
         }, timeout=15)
         d = r.json()
         if d.get('status') == 1:
+            print(f'[CAPTCHA] 2captcha solved: {d["request"]}', flush=True)
             return str(d['request'])
         if d.get('request') != 'CAPCHA_NOT_READY':
             raise ValueError(f"2captcha error: {d.get('request')}")
-        time.sleep(1.5)
+        time.sleep(1)
     raise ValueError("2captcha: tiempo de espera agotado")
+
+
+def _fetch_sat_by_requests(value: str, tipo: str, doc_type: str) -> dict:
+    """
+    Requests-based SAT query (no browser needed).
+    Faster/lighter than Playwright and uses a different network fingerprint.
+    Raises on failure so caller can fall back to Playwright.
+    """
+    import requests as _req, re as _re
+    import warnings as _w; _w.filterwarnings('ignore')
+
+    proxies = {'http': _SAT_PROXY, 'https': _SAT_PROXY} if _SAT_PROXY else None
+    hdrs = {
+        'User-Agent': _USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-MX,es;q=0.9,en-US;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+
+    for _attempt in range(2):
+        sess = _req.Session()
+        sess.headers.update(hdrs)
+        try:
+            r = sess.get(_SAT_URL, verify=False, timeout=10, proxies=proxies)
+            r.raise_for_status()
+            html = r.text
+
+            # ── ViewState ─────────────────────────────────────────────────────
+            vs = _re.search(r'javax\.faces\.ViewState[^>]+value="([^"]+)"', html)
+            if not vs:
+                raise ValueError("No ViewState en la página SAT")
+            view_state = vs.group(1)
+
+            # ── Captcha image (inline base64) ─────────────────────────────────
+            cap = (_re.search(r'id="captchaSession"[^>]+src="data:image/[^;]+;base64,([A-Za-z0-9+/=]+)"', html)
+                   or _re.search(r'captchaSession[^>]+src="data:image/[^;]+;base64,([A-Za-z0-9+/=]+)"', html)
+                   or _re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]{200,})', html))
+            if not cap:
+                raise ValueError("Captcha no encontrado en la página SAT")
+            captcha_b64 = cap.group(1)
+
+            # ── Auto-solve captcha ────────────────────────────────────────────
+            captcha_sol = _solve_captcha_2captcha(captcha_b64)
+            print(f'[SAT-req] captcha solved: {captcha_sol}', flush=True)
+
+            # ── Form action ───────────────────────────────────────────────────
+            fa = (_re.search(r'<form[^>]+id="formapp"[^>]+action="([^"]+)"', html)
+                  or _re.search(r'<form[^>]+action="([^"]+)"[^>]*id="formapp"', html))
+            form_action = fa.group(1) if fa else _SAT_URL
+            if form_action.startswith('/'):
+                from urllib.parse import urljoin as _uj
+                form_action = _uj(_SAT_URL, form_action)
+
+            # ── Field names ───────────────────────────────────────────────────
+            def _fn(pat):
+                m = _re.search(pat, html)
+                return m.group(1) if m else None
+
+            tipo_nm = (_fn(r'<input[^>]+id="formapp:tipo:0"[^>]+name="([^"]+)"')
+                       or _fn(r'name="(formapp:tipo)"') or 'formapp:tipo')
+            doc_nm  = (_fn(r'<input[^>]+id="formapp:doc:0"[^>]+name="([^"]+)"') or 'formapp:doc')
+            val_nm  = (_fn(r'<input[^>]+id="formapp:val"[^>]+name="([^"]+)"') or 'formapp:val')
+            cap_nm  = (_fn(r'<input[^>]+maxlength="5"[^>]+name="([^"]+)"')
+                       or _fn(r'<input[^>]+name="([^"]+)"[^>]+maxlength="5"')
+                       or _fn(r'<input[^>]+id="[^"]*captcha[^"]*"[^>]+name="([^"]+)"')
+                       or 'formapp:captchatext')
+            btn_nm  = (_fn(r'<(?:input|button)[^>]+id="formapp:j_idt\d+"[^>]+name="([^"]+)"')
+                       or 'formapp:j_idt42')
+
+            post_data = {
+                'javax.faces.ViewState': view_state,
+                'formapp': 'formapp',
+                tipo_nm:   '0' if tipo == 'F' else '1',
+                val_nm:    value,
+                cap_nm:    captcha_sol,
+                btn_nm:    'Consultar',
+            }
+            if tipo == 'F':
+                post_data[doc_nm] = '0' if doc_type == 'RFC' else '1'
+
+            result_r = sess.post(
+                form_action, data=post_data, verify=False, timeout=20,
+                proxies=proxies,
+                headers={
+                    'Referer': _SAT_URL,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Origin': 'https://agsc.siat.sat.gob.mx',
+                }
+            )
+            body = _re.sub(r'<[^>]+>', ' ', result_r.text)
+            body = _re.sub(r'\s+', ' ', body).strip()
+
+            if ('Resultado' not in body and 'Registrado' not in body
+                    and 'No localizado' not in body and 'Cancelado' not in body):
+                if _attempt < 2:
+                    time.sleep(1)
+                    continue
+                raise ValueError("Error de captcha o respuesta inesperada")
+
+            def _ext(pat, txt, default=''):
+                m = _re.search(pat, txt, _re.IGNORECASE)
+                return m.group(1).strip() if m else default
+
+            result = {
+                'found':        'Registrado' in body,
+                'tipo_persona': _ext(r'Tipo de persona\s*:?\s*(\S[^\n]{0,60})', body),
+                'nombre':       _ext(r'(?:Nombre|Raz[oó]n Social)\s*:?\s*(\S[^\n]{0,80})', body),
+                'rfc':          _ext(r'RFC\s*:?\s*([A-Z&\xd1]{3,4}\d{6}[A-Z0-9]{3,4})', body),
+                'curp':         _ext(r'CURP\s*:?\s*([A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d)', body),
+                'estatus':      _ext(r'(?:Estatus|Situaci[oó]n)\s*:?\s*(\S[^\n]{0,60})', body),
+            }
+            if not result['estatus']:
+                result['estatus'] = ('Registrado en el padrón de contribuyentes'
+                                     if result['found'] else 'No localizado en el padrón')
+            print(f'[SAT-req] result: {result}', flush=True)
+            return result
+
+        except Exception as _e:
+            print(f'[SAT-req] attempt {_attempt+1} failed: {_e}', flush=True)
+            if _attempt < 2:
+                time.sleep(1)
+    raise ValueError("No se pudo consultar SAT vía requests")
 
 
 def _fetch_sat_contribuyente_inner(value: str, tipo: str, doc_type: str) -> dict:
     """
     Query SAT ConsultaIdCSIAT (agsc.siat.sat.gob.mx).
-    tipo: 'F' (Física) | 'M' (Moral)
-    doc_type: 'RFC' | 'CURP'  (CURP only valid when tipo='F')
-    Returns dict with keys: found, estatus, tipo_persona, nombre, rfc, curp
+    Tries requests-based approach first (faster, different fingerprint),
+    falls back to Playwright if requests can't reach the site.
     """
-    import re as _re
+    # ── Try fast requests path first ─────────────────────────────────────────
+    try:
+        return _fetch_sat_by_requests(value, tipo, doc_type)
+    except Exception as _req_err:
+        _req_str = str(_req_err)
+        if 'timeout' in _req_str.lower() or 'connect' in _req_str.lower() or 'timed out' in _req_str.lower():
+            raise ValueError(
+                "El portal del SAT (agsc.siat.sat.gob.mx) no responde desde el servidor. "
+                "Configura SAT_PROXY con una IP mexicana para resolver esto."
+            )
+        print(f'[SAT] requests path failed ({_req_err}), falling back to Playwright', flush=True)
 
-    if not _SAT_PROXY:
-        raise ValueError(
-            "SAT_PROXY no configurado — el portal SAT requiere IP mexicana. "
-            "Configura SAT_PROXY en el servicio (ej. http://user:pass@proxy-mx:port)."
-        )
+    import re as _re
 
     for _attempt in range(3):
         with sync_playwright() as p:
             _proxy_cfg = {'server': _SAT_PROXY} if _SAT_PROXY else None
-            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS,
-                                        proxy=_proxy_cfg)
+            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS, proxy=_proxy_cfg)
             ctx     = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
             page    = ctx.new_page()
+            # Block images/fonts/media to speed up page load
+            page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,mp4,webp}',
+                       lambda route: route.abort())
             try:
-                # Use 'commit' so we don't wait for all resources, then
-                # explicitly wait for the form to appear (up to 60s)
+                t0 = time.time()
+                page.goto(_SAT_URL, wait_until='domcontentloaded', timeout=90000)
+                print(f'[SAT] page loaded in {time.time()-t0:.1f}s', flush=True)
+                # Wait for captcha image — it's the key signal the form is ready
                 try:
-                    page.goto(_SAT_URL, wait_until='commit', timeout=60000)
+                    page.wait_for_selector('#captchaSession', timeout=15000)
                 except Exception:
-                    page.goto(_SAT_URL, wait_until='commit', timeout=60000)
-                # Wait for the form / captcha image to be present
-                try:
-                    page.wait_for_selector('#captchaSession', timeout=30000)
-                except Exception:
-                    page.wait_for_timeout(5000)
+                    page.wait_for_timeout(2000)
+                print(f'[SAT] form ready in {time.time()-t0:.1f}s', flush=True)
 
                 # ── Select tipo de persona ────────────────────────────────────
                 tipo_idx = '0' if tipo == 'F' else '1'
@@ -10367,7 +11627,7 @@ def _fetch_sat_contribuyente_inner(value: str, tipo: str, doc_type: str) -> dict
                         if (r) r.click();
                     }})()
                 """)
-                page.wait_for_timeout(600)
+                page.wait_for_timeout(300)
 
                 # ── Select doc type (RFC vs CURP, only for Física) ───────────
                 if tipo == 'F':
@@ -10378,7 +11638,7 @@ def _fetch_sat_contribuyente_inner(value: str, tipo: str, doc_type: str) -> dict
                             if (r) r.click();
                         }})()
                     """)
-                    page.wait_for_timeout(600)
+                    page.wait_for_timeout(200)
 
                 # ── Fill value ────────────────────────────────────────────────
                 page.evaluate("""
@@ -10401,9 +11661,10 @@ def _fetch_sat_contribuyente_inner(value: str, tipo: str, doc_type: str) -> dict
                     browser.close()
                     raise ValueError("No se pudo obtener el captcha del portal SAT")
 
-                # ── Solve with 2captcha ───────────────────────────────────────
+                # ── Solve captcha (local ddddocr first, 2captcha fallback) ───
+                t1 = time.time()
                 captcha_sol = _solve_captcha_2captcha(captcha_b64)
-                print(f'[SAT] captcha solved: {captcha_sol}', flush=True)
+                print(f'[SAT] captcha solved in {time.time()-t1:.1f}s: {captcha_sol}', flush=True)
 
                 # ── Fill captcha answer ───────────────────────────────────────
                 # The captcha field ID contains JSF autogenerated part (j_idtXX).
@@ -10551,6 +11812,7 @@ def _fetch_antecedente_doc_inner(folio_real: str, partida: int) -> dict:
         browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
         context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
         page = context.new_page()
+        page.set_default_timeout(45000)
         _login_and_open_consulta(page)
         _rpp_pool_stats['logins'] += 1
         _rpp_login_time = time.time()
@@ -10602,9 +11864,11 @@ def _fetch_antecedente_doc_inner(folio_real: str, partida: int) -> dict:
             "Puede que no esté digitalizado en el sistema RPP."
         )
 
+    raw_agr  = _b64.b64decode(result_b64['agregado'])
+    raw_insc = _b64.b64decode(result_b64['inscripcion']) if result_b64.get('inscripcion') else None
     data = {
-        'agregado':    _b64.b64decode(result_b64['agregado']),
-        'inscripcion': _b64.b64decode(result_b64['inscripcion']) if result_b64.get('inscripcion') else None,
+        'agregado':    remove_watermarks(raw_agr),
+        'inscripcion': remove_watermarks(raw_insc) if raw_insc else None,
     }
     _set_cached_anteced(folio_real, partida, data)
     return data
@@ -10681,8 +11945,8 @@ def antecedentes_documento():
 
         dl = get_dl_info(u)
         if dl['left'] <= 0:
-            return jsonify({'error': 'Sin créditos de descarga este mes', 'no_quota': True,
-                            'downloads_left': 0}), 402
+            msg = 'El trial no incluye descargas — suscríbete para descargar' if u.get('in_trial') else 'Sin créditos de descarga este mes'
+            return jsonify({'error': msg, 'no_quota': True, 'downloads_left': 0, 'goto': '/pricing'}), 402
 
     # ── Fetch docs ────────────────────────────────────────────────────────────
     try:
@@ -10771,6 +12035,7 @@ def _fetch_predial_inner(clave_catastral: str) -> dict:
         browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
         context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
         page = context.new_page()
+        page.set_default_timeout(45000)
 
         # ── URL capture (no context.route — does NOT touch main page load) ───
         edo_cta_ref = {'url': None}
@@ -10998,6 +12263,636 @@ def _fetch_predial_inner(clave_catastral: str) -> dict:
 fetch_predial = _retry_rpp(_fetch_predial_inner, max_retries=2, backoff_base=3)
 
 
+# ── CURP → RFC SAT ────────────────────────────────────────────────────────────
+_CURP_SAT_URL   = 'https://agsc.siat.sat.gob.mx/PTSC/ConsultaIdCSIAT/'
+_CURP_SAT_PROXY = {'server': 'http://172.28.0.2:8888'}
+
+def _sat_browser_session(session_id, curp, sess, ready_evt, submit_evt):
+    """Playwright session that pauses at captcha and waits for human input."""
+    import base64 as _b64m
+    from urllib.parse import urljoin
+
+    def _ext(pattern, text, default=''):
+        import re as _re
+        m = _re.search(pattern, text, _re.IGNORECASE | _re.DOTALL)
+        return m.group(1).strip() if m else default
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=BROWSER_ARGS, proxy=_CURP_SAT_PROXY)
+        ctx = browser.new_context(
+            ignore_https_errors=True,
+            user_agent=_USER_AGENT,
+            extra_http_headers={'Accept-Language': 'es-MX,es;q=0.9'},
+        )
+        page = ctx.new_page()
+        try:
+            # 1. Load form
+            print(f'[CURP-H] loading {_CURP_SAT_URL}', flush=True)
+            page.goto(_CURP_SAT_URL, wait_until='domcontentloaded', timeout=30000)
+            page.wait_for_timeout(2500)
+
+            # 2. Persona Física
+            radios = page.query_selector_all('input[type=radio]')
+            if not radios:
+                raise ValueError("Formulario SAT no encontrado")
+            radios[0].click()
+            print('[CURP-H] clicked Persona Fisica', flush=True)
+            page.wait_for_timeout(2500)
+
+            # 3. CURP radio
+            for r in page.query_selector_all('input[type=radio]'):
+                if r.get_attribute('value') == 'CURP':
+                    r.click()
+                    print('[CURP-H] clicked CURP radio', flush=True)
+                    break
+            page.wait_for_timeout(2500)
+
+            # 4. Fill CURP
+            curp_field = page.query_selector('#formapp\\:val')
+            if not curp_field:
+                for inp in page.query_selector_all('input[type=text]'):
+                    if 'captcha' not in (inp.get_attribute('id') or '').lower():
+                        curp_field = inp
+                        break
+            if not curp_field:
+                raise ValueError("Campo CURP no encontrado")
+            curp_field.fill(curp)
+            print(f'[CURP-H] filled CURP: {curp}', flush=True)
+
+            # 5. Get captcha image
+            cap_img = None
+            for sel in ('img[id*="aptcha"]', 'img[id*="Captcha"]'):
+                cap_img = page.query_selector(sel)
+                if cap_img:
+                    break
+            if not cap_img:
+                raise ValueError("Imagen de captcha no encontrada")
+
+            src = cap_img.get_attribute('src') or ''
+            if src.startswith('data:'):
+                captcha_b64 = src.split(',', 1)[1]
+            else:
+                if not src.startswith('http'):
+                    src = urljoin(_CURP_SAT_URL, src)
+                cap_resp = page.request.get(src)
+                captcha_b64 = _b64m.b64encode(cap_resp.body()).decode()
+
+            print(f'[CURP-H] captcha ready, len={len(captcha_b64)}', flush=True)
+            sess['captcha_b64'] = captcha_b64
+            sess['status'] = 'waiting_captcha'
+            ready_evt.set()  # unblock HTTP response
+
+            # 6. Wait for user to submit captcha (max 5 min)
+            submit_evt.wait(timeout=300)
+            captcha_text = sess.get('captcha_text', '')
+            if not captcha_text:
+                raise ValueError("Tiempo agotado esperando el captcha del usuario")
+
+            # 7. Fill captcha and submit
+            cap_input = page.query_selector('#formapp\\:j_idt34\\:captcha')
+            if not cap_input:
+                cap_input = page.query_selector('input[id*="captcha"]')
+            if not cap_input:
+                txt_inputs = page.query_selector_all('input[type=text]')
+                if txt_inputs:
+                    cap_input = txt_inputs[-1]
+            if cap_input:
+                cap_input.fill(captcha_text)
+                print(f'[CURP-H] filled captcha: {captcha_text}', flush=True)
+
+            submit = page.query_selector('input[type=submit], button[type=submit]')
+            if submit:
+                submit.click()
+                print('[CURP-H] clicked submit', flush=True)
+
+            # 8. Wait for result
+            try:
+                page.wait_for_function(
+                    "() => { const t=document.body.innerText||''; return t.includes('Registrado')||t.includes('localiz')||t.includes('RFC:')||t.includes('No encontr')||t.includes('inténtelo'); }",
+                    timeout=15000
+                )
+            except Exception:
+                page.wait_for_timeout(6000)
+
+            all_text = page.evaluate("document.body.innerText || ''")
+            all_html = page.evaluate("document.body.innerHTML || ''")
+            print(f'[CURP-H] result: {repr(all_text[:400])}', flush=True)
+            browser.close()
+
+            # 9. Parse
+            import re as _re
+            not_found = any(s in all_text.lower() for s in ['no localiz','no encontr','no registr','no existe'])
+            found = any(s in all_text for s in ['Registrado','Activo','RFC:']) and not not_found
+
+            rfc_val  = _ext(r'\b([A-Z&\xd1]{3,4}\d{6}[A-Z0-9]{3,4})\b', all_html)
+            nombre_v = _ext(r'Nombre[^:]*:\s*([^\n<]{3,80})', all_text)
+            estatus  = _ext(r'[Ee]statu[st][^:]*:\s*([^\n<]{3,80})', all_text)
+
+            if found:
+                mensaje = estatus or 'Registrado en el padrón de contribuyentes'
+            elif not_found:
+                mensaje = 'CURP no localizada en el padrón de contribuyentes'
+            else:
+                mensaje = estatus or all_text.strip()[:200] or 'Sin resultado'
+
+            sess['result'] = {'rfc_found': found, 'curp': curp, 'rfc': rfc_val,
+                              'nombre': nombre_v, 'mensaje': mensaje}
+            sess['status'] = 'done'
+
+        except Exception as e:
+            try: browser.close()
+            except Exception: pass
+            raise
+
+
+def _fetch_curp_rfc_inner(curp: str, cp: str = '', tel: str = '') -> dict:
+    """
+    Verifica CURP en SAT vía agsc.siat.sat.gob.mx (proxy mexicano Mullvad).
+    Flujo: Persona Física → CURP radio → llenar CURP → captcha → Consultar.
+    """
+    import re as _re, json as _json, base64 as _b64m
+    from urllib.parse import urljoin
+
+    def _ext(pattern, text, default=''):
+        m = _re.search(pattern, text, _re.IGNORECASE | _re.DOTALL)
+        return m.group(1).strip() if m else default
+
+    for _attempt in range(3):
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS, proxy=_CURP_SAT_PROXY)
+            ctx = browser.new_context(
+                ignore_https_errors=True,
+                user_agent=_USER_AGENT,
+                extra_http_headers={'Accept-Language': 'es-MX,es;q=0.9'},
+            )
+            page = ctx.new_page()
+
+            _responses = []
+            def _on_resp(response):
+                try:
+                    ct = response.headers.get('content-type', '')
+                    if response.status == 200 and ('json' in ct or 'html' in ct or 'text' in ct):
+                        body = response.text()
+                        if body and len(body) > 10:
+                            _responses.append({'url': response.url,
+                                               'method': response.request.method,
+                                               'body': body[:3000]})
+                            print(f'[CURP] {response.request.method} {response.url[:80]} len={len(body)}', flush=True)
+                except Exception:
+                    pass
+            page.on('response', _on_resp)
+
+            try:
+                # ── 1. Cargar formulario ──────────────────────────────────────
+                print(f'[CURP] loading {_CURP_SAT_URL}', flush=True)
+                page.goto(_CURP_SAT_URL, wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(2500)
+
+                # ── 2. Click Persona Física ───────────────────────────────────
+                radios = page.query_selector_all('input[type=radio]')
+                if not radios:
+                    raise ValueError("No se encontró el formulario SAT (sin radios)")
+                radios[0].click()
+                print('[CURP] clicked Persona Fisica', flush=True)
+                page.wait_for_timeout(2500)
+
+                # ── 3. Click radio CURP ───────────────────────────────────────
+                curp_radio = None
+                for r in page.query_selector_all('input[type=radio]'):
+                    if r.get_attribute('value') == 'CURP':
+                        curp_radio = r
+                        break
+                if curp_radio:
+                    curp_radio.click()
+                    print('[CURP] clicked CURP radio', flush=True)
+                    page.wait_for_timeout(2500)
+
+                # ── 4. Llenar CURP en formapp:val ─────────────────────────────
+                curp_field = page.query_selector('#formapp\:val')
+                if not curp_field:
+                    for inp in page.query_selector_all('input[type=text]'):
+                        if 'captcha' not in (inp.get_attribute('id') or '').lower():
+                            curp_field = inp
+                            break
+                if not curp_field:
+                    raise ValueError("No se encontró campo de valor CURP")
+                curp_field.click()
+                curp_field.fill(curp)
+                print(f'[CURP] filled CURP: {curp}', flush=True)
+
+                # ── 5. Resolver captcha ───────────────────────────────────────
+                cap_img = None
+                for sel in ('img[id*="aptcha"]', 'img[id*="Captcha"]',
+                            'img[src*="aptcha"]', 'img[src*="Captcha"]',
+                            'img[src^="data:image"]'):
+                    cap_img = page.query_selector(sel)
+                    if cap_img:
+                        print(f'[CURP] found captcha: {sel}', flush=True)
+                        break
+
+                if cap_img:
+                    src = cap_img.get_attribute('src') or ''
+                    print(f'[CURP] captcha src[:80]: {src[:80]}', flush=True)
+                    if src.startswith('data:'):
+                        # src ya es data URI — usar directamente
+                        captcha_b64 = src.split(',', 1)[1]
+                        print(f'[CURP] captcha from data-uri len={len(captcha_b64)}', flush=True)
+                    else:
+                        # URL relativa o absoluta — fetchear
+                        if not src.startswith('http'):
+                            src = urljoin(_CURP_SAT_URL, src)
+                        cap_resp = page.request.get(src)
+                        captcha_b64 = _b64m.b64encode(cap_resp.body()).decode()
+                        print(f'[CURP] captcha from url len={len(captcha_b64)}', flush=True)
+                    captcha_sol = _solve_captcha_2captcha(captcha_b64)
+                    print(f'[CURP] captcha solved: {captcha_sol}', flush=True)
+
+                    cap_input = page.query_selector('#formapp\:j_idt34\:captcha')
+                    if not cap_input:
+                        cap_input = page.query_selector('input[id*="captcha"]')
+                    if not cap_input:
+                        txt_inputs = page.query_selector_all('input[type=text]')
+                        if txt_inputs:
+                            cap_input = txt_inputs[-1]
+                    if cap_input:
+                        cap_input.click()
+                        cap_input.fill(captcha_sol)
+                        print('[CURP] filled captcha', flush=True)
+
+                # ── 6. Submit ─────────────────────────────────────────────────
+                submit = page.query_selector('input[type=submit], button[type=submit]')
+                if submit:
+                    submit.click()
+                    print('[CURP] clicked submit', flush=True)
+                else:
+                    page.evaluate("() => { const b = document.querySelector('input[type=submit],button[type=submit]'); if(b) b.click(); }")
+
+                # ── 7. Esperar resultado ──────────────────────────────────────
+                try:
+                    page.wait_for_function(
+                        "() => { const t = document.body.innerText||''; return t.includes('Registrado')||t.includes('localiz')||t.includes('RFC:')||t.includes('No encontr'); }",
+                        timeout=15000
+                    )
+                except Exception:
+                    page.wait_for_timeout(6000)
+
+                all_text = page.evaluate("document.body.innerText || ''")
+                all_html = page.evaluate("document.body.innerHTML || ''")
+                print(f'[CURP] result: {repr(all_text[:500])}', flush=True)
+                browser.close()
+
+                # ── 8. Parsear ────────────────────────────────────────────────
+                # Detectar captcha incorrecto — el form sigue igual pero con aviso
+                bad_captcha = any(s in all_text.lower() for s in
+                                  ['capture los caracteres', 'captcha incorrecto',
+                                   'incorrecto', 'vuelva a intentar', 'caracteres de la imagen'])
+                if bad_captcha and _attempt < 2:
+                    print('[CURP] bad captcha, retrying', flush=True)
+                    time.sleep(1)
+                    continue
+
+                not_found = any(s in all_text.lower() for s in
+                                ['no localiz', 'no encontr', 'no registr', 'no existe'])
+                # "Registrado" o "Activo" como RESULTADO (no como título de página)
+                found = any(s in all_text for s in
+                            ['Registrado', 'Activo', 'RFC:']) and not not_found
+
+                rfc_val  = _ext(r'\b([A-Z&\xd1]{3,4}\d{6}[A-Z0-9]{3,4})\b', all_html)
+                nombre_v = _ext(r'Nombre[^:]*:\s*([^\n<]{3,80})', all_text)
+                estatus  = _ext(r'[Ee]statu[st][^:]*:\s*([^\n<]{3,80})', all_text)
+
+                if found:
+                    mensaje = estatus or 'Registrado en el padrón de contribuyentes'
+                elif not_found:
+                    mensaje = 'CURP no localizada en el padrón de contribuyentes'
+                else:
+                    mensaje = estatus or all_text.strip()[:200] or 'Sin resultado'
+
+                return {'rfc_found': found, 'curp': curp, 'rfc': rfc_val,
+                        'nombre': nombre_v, 'mensaje': mensaje}
+
+            except Exception as e:
+                try: browser.close()
+                except Exception: pass
+                if _attempt < 2:
+                    print(f'[CURP] attempt {_attempt+1} error: {e} — retrying', flush=True)
+                    time.sleep(2)
+                    continue
+                raise
+
+    raise ValueError("No se pudo consultar el portal SAT CURP después de 3 intentos")
+
+
+@app.route('/curp/consultar', methods=['POST'])
+@login_required
+def curp_consultar():
+    u = current_user()
+    data = request.get_json() or {}
+    curp = (data.get('curp', '') or '').strip().upper()
+    cp   = (data.get('cp',   '') or '').strip()
+    tel  = (data.get('tel',  '') or '').strip()
+    if len(curp) != 18:
+        return jsonify({'error': 'CURP inválida — debe tener 18 caracteres'}), 400
+    _cleanup_old_jobs()
+    job_id = str(uuid.uuid4())
+    _job_create(job_id, {'status': 'running', 'result': None, 'error': None,
+                         'type': 'curp', 'ts': time.time()})
+    def run():
+        try:
+            result = _fetch_curp_rfc_inner(curp, cp=cp, tel=tel)
+            _job_set(job_id, {'status': 'done', 'result': result})
+        except Exception as e:
+            _job_set(job_id, {'status': 'error', 'error': str(e)})
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/curp/captcha/iniciar', methods=['POST'])
+@login_required
+def curp_captcha_iniciar():
+    """Step 1: Load SAT form, fill CURP, return captcha image to user."""
+    data = request.get_json() or {}
+    curp = (data.get('curp', '') or '').strip().upper()
+    if len(curp) != 18:
+        return jsonify({'error': 'CURP inválida — debe tener 18 caracteres'}), 400
+
+    session_id = str(uuid.uuid4())
+    ready_evt   = threading.Event()
+    submit_evt  = threading.Event()
+
+    sess = {
+        'status':        'loading',
+        'captcha_b64':   None,
+        'captcha_text':  None,
+        'result':        None,
+        'error':         None,
+        'ready_evt':     ready_evt,
+        'submit_evt':    submit_evt,
+        'curp':          curp,
+    }
+    with _sat_sessions_lock:
+        _sat_sessions[session_id] = sess
+
+    def run():
+        try:
+            _sat_browser_session(session_id, curp, sess, ready_evt, submit_evt)
+        except Exception as e:
+            import traceback
+            msg = traceback.format_exc()
+            app.logger.error(f'[CURP-H] EXCEPTION: {msg}')
+            sess['error']  = str(e)
+            sess['status'] = 'error'
+            ready_evt.set()
+
+    threading.Thread(target=run, daemon=True).start()
+
+    # Wait up to 35s for captcha to be ready
+    ready_evt.wait(timeout=35)
+
+    if sess.get('error'):
+        app.logger.error(f'[CURP-H] iniciar error: {sess["error"]}')
+        return jsonify({'error': sess['error']}), 500
+    if not sess.get('captcha_b64'):
+        app.logger.error(f'[CURP-H] iniciar timeout: no captcha after 35s')
+        return jsonify({'error': 'No se pudo cargar el captcha del SAT (timeout)'}), 500
+
+    return jsonify({'session_id': session_id, 'captcha_b64': sess['captcha_b64']})
+
+
+@app.route('/curp/captcha/resolver', methods=['POST'])
+@login_required
+def curp_captcha_resolver():
+    """Step 2: Receive captcha text from user, submit form, return result."""
+    data = request.get_json() or {}
+    session_id   = data.get('session_id', '')
+    captcha_text = (data.get('captcha', '') or '').strip()
+
+    with _sat_sessions_lock:
+        sess = _sat_sessions.get(session_id)
+
+    if not sess:
+        return jsonify({'error': 'Sesión no encontrada o expirada'}), 404
+    if not captcha_text:
+        return jsonify({'error': 'Ingresa el texto del captcha'}), 400
+
+    sess['captcha_text'] = captcha_text
+    sess['submit_evt'].set()
+
+    # Wait up to 30s for result
+    start = time.time()
+    while time.time() - start < 30:
+        if sess.get('status') in ('done', 'error'):
+            break
+        time.sleep(0.4)
+
+    with _sat_sessions_lock:
+        _sat_sessions.pop(session_id, None)
+
+    if sess.get('error'):
+        return jsonify({'error': sess['error']}), 500
+
+    result = sess.get('result') or {}
+    return jsonify(result)
+
+
+# ── SAT interactive captcha sessions ─────────────────────────────────────────
+_sat_sessions: dict = {}
+_sat_sessions_lock = threading.Lock()
+
+def _sat_session_cleanup():
+    now = time.time()
+    with _sat_sessions_lock:
+        expired = [k for k, v in list(_sat_sessions.items()) if now - v['ts'] > 300]
+        for k in expired:
+            try: v['pw'].stop()
+            except Exception: pass
+            del _sat_sessions[k]
+
+def _sat_load_captcha(session_id: str, value: str, tipo: str, doc_type: str):
+    """Load SAT page and return captcha.
+    Tries fast requests path first (auto-solve → returns {'auto_result': {...}}).
+    Falls back to Playwright to get captcha for manual entry (returns b64 string).
+    """
+    # ── Fast path: requests auto-solve ───────────────────────────────────────
+    _network_err = False
+    try:
+        auto = _fetch_sat_by_requests(value, tipo, doc_type)
+        print('[SAT] auto-solved via requests', flush=True)
+        return {'auto_result': auto}
+    except Exception as _ae:
+        _ae_str = str(_ae)
+        # If it's a network-level failure (timeout/connection), Playwright on the
+        # same VPS will also fail — skip it and surface the error immediately.
+        if 'timeout' in _ae_str.lower() or 'connect' in _ae_str.lower() or 'timed out' in _ae_str.lower():
+            _network_err = True
+            print(f'[SAT] network unreachable ({_ae}) — skipping Playwright', flush=True)
+        else:
+            print(f'[SAT] requests failed ({_ae}), trying Playwright', flush=True)
+
+    if _network_err:
+        raise ValueError(
+            "El portal del SAT (agsc.siat.sat.gob.mx) no responde desde el servidor. "
+            "Es posible que el SAT esté bloqueando la IP del VPS. "
+            "Configura SAT_PROXY con una IP mexicana para resolver esto."
+        )
+
+    # ── Slow path: Playwright, show captcha to user ───────────────────────────
+    from playwright.sync_api import sync_playwright as _sp
+    pw      = _sp().start()
+    browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
+    ctx     = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
+    page    = ctx.new_page()
+    page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,mp4,webp}',
+               lambda route: route.abort())
+    try:
+        page.goto(_SAT_URL, wait_until='domcontentloaded', timeout=90000)
+        try:
+            page.wait_for_selector('#captchaSession', timeout=15000)
+        except Exception:
+            page.wait_for_timeout(3000)
+
+        # Select tipo de persona
+        tipo_idx = '0' if tipo == 'F' else '1'
+        page.evaluate(f"""(() => {{ const r = document.querySelector('[id="formapp:tipo:{tipo_idx}"]'); if(r) r.click(); }})()""")
+        page.wait_for_timeout(200)
+
+        # Select doc type
+        if tipo == 'F':
+            doc_idx = '0' if doc_type == 'RFC' else '1'
+            page.evaluate(f"""(() => {{ const r = document.querySelector('[id="formapp:doc:{doc_idx}"]'); if(r) r.click(); }})()""")
+            page.wait_for_timeout(200)
+
+        # Fill value
+        page.evaluate(f"""((v) => {{ const el = document.querySelector('[id="formapp:val"]'); if(el) {{ el.focus(); el.value=v; el.dispatchEvent(new Event('input')); }} }})({repr(value)})""")
+
+        # Extract captcha
+        captcha_b64 = page.evaluate("""(() => {
+            const el = document.getElementById('captchaSession');
+            if (el && el.src && el.src.startsWith('data:')) return el.src.split(',')[1];
+            return null;
+        })()""")
+        if not captcha_b64:
+            pw.stop()
+            raise ValueError("No se pudo obtener el captcha del portal SAT")
+
+        with _sat_sessions_lock:
+            _sat_sessions[session_id] = {
+                'pw': pw, 'browser': browser, 'page': page,
+                'ts': time.time(), 'captcha_b64': captcha_b64,
+            }
+        return captcha_b64
+    except Exception:
+        try: pw.stop()
+        except Exception: pass
+        raise
+
+
+@app.route('/sat/captcha', methods=['POST'])
+@login_required
+def sat_captcha():
+    """Step 1: load SAT page, return captcha image to show the user."""
+    data     = request.get_json() or {}
+    value    = (data.get('value', '') or '').strip().upper().replace(' ', '')
+    tipo     = (data.get('tipo', 'F') or 'F').upper()
+    doc_type = (data.get('doc_type', 'RFC') or 'RFC').upper()
+    if not value:
+        return jsonify({'error': 'Ingresa un RFC o CURP'}), 400
+    _sat_session_cleanup()
+    session_id = str(uuid.uuid4())
+    job_id     = str(uuid.uuid4())
+    _cleanup_old_jobs()
+    _job_create(job_id, {'status': 'running', 'result': None, 'error': None,
+                         'type': 'sat_captcha', 'ts': time.time()})
+    def run():
+        try:
+            ret = _sat_load_captcha(session_id, value, tipo, doc_type)
+            if isinstance(ret, dict) and 'auto_result' in ret:
+                # Requests path auto-solved — no captcha needed
+                _job_set(job_id, {'status': 'done', 'result': {'auto_result': ret['auto_result']}})
+            else:
+                # Playwright path — show captcha to user
+                _job_set(job_id, {'status': 'done', 'result': {'session_id': session_id, 'captcha_b64': ret}})
+        except Exception as e:
+            _job_set(job_id, {'status': 'error', 'error': str(e)})
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/sat/verificar', methods=['POST'])
+@login_required
+def sat_verificar():
+    """Step 2: submit user-solved captcha and return SAT result."""
+    import re as _re
+    data       = request.get_json() or {}
+    session_id = data.get('session_id', '').strip()
+    captcha    = data.get('captcha', '').strip()
+    if not session_id or not captcha:
+        return jsonify({'error': 'Sesión o captcha inválido'}), 400
+
+    with _sat_sessions_lock:
+        sess = _sat_sessions.pop(session_id, None)
+    if not sess:
+        return jsonify({'error': 'Sesión expirada — vuelve a consultar'}), 410
+
+    page = sess['page']
+    try:
+        # Fill captcha field
+        page.evaluate(f"""((sol) => {{
+            let el = document.querySelector('[id*="captcha"][type="text"]');
+            if (!el) el = Array.from(document.querySelectorAll('input[type="text"]')).find(i => i.maxLength === 5);
+            if (el) {{ el.focus(); el.value = sol; el.dispatchEvent(new Event('input')); el.dispatchEvent(new Event('change')); }}
+        }})({repr(captcha)})""")
+
+        # Click Consultar
+        page.evaluate("""(() => {
+            let btn = document.querySelector('[id="formapp:j_idt42"]');
+            if (!btn) btn = Array.from(document.querySelectorAll('button,input[type="submit"],input[type="button"]'))
+                .find(b => (b.textContent||b.value||'').trim() === 'Consultar');
+            if (btn) btn.click();
+        })()""")
+
+        # Wait for result
+        try:
+            page.wait_for_function(
+                "() => document.body.innerText.includes('Resultado') || "
+                "document.body.innerText.includes('Registrado') || "
+                "document.body.innerText.includes('No localizado') || "
+                "document.body.innerText.includes('Cancelado')",
+                timeout=8000
+            )
+        except Exception:
+            page.wait_for_timeout(3000)
+
+        body = page.evaluate('document.body.innerText')
+        try: sess['pw'].stop()
+        except Exception: pass
+
+        if ('Resultado' not in body and 'Registrado' not in body
+                and 'No localizado' not in body and 'Cancelado' not in body):
+            return jsonify({'error': 'Captcha incorrecto — intenta de nuevo'}), 400
+
+        def _ext(pattern, text, default=''):
+            m = _re.search(pattern, text, _re.IGNORECASE | _re.MULTILINE)
+            return m.group(1).strip() if m else default
+
+        result = {
+            'found':        'Registrado' in body,
+            'tipo_persona': _ext(r'Tipo de persona[:\s]+([^\n]+)', body),
+            'nombre':       _ext(r'(?:Nombre|Raz[oó]n Social)[:\s]+([^\n]+)', body),
+            'rfc':          _ext(r'RFC[:\s]+([A-Z&]{3,4}\d{6}[A-Z0-9]{3,4})', body),
+            'curp':         _ext(r'CURP[:\s]+([A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d)', body),
+            'estatus':      _ext(r'(?:Estatus|Situaci[oó]n)[:\s]+([^\n]+)', body),
+        }
+        if not result['estatus']:
+            result['estatus'] = 'Registrado en el padrón de contribuyentes' if result['found'] else 'No localizado'
+        return jsonify(result)
+
+    except Exception as e:
+        try: sess['pw'].stop()
+        except Exception: pass
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/sat/consultar', methods=['POST'])
 @login_required
 def sat_consultar():
@@ -11012,8 +12907,6 @@ def sat_consultar():
         tipo = 'F'
     if doc_type not in ('RFC', 'CURP'):
         doc_type = 'RFC'
-    if not TWOCAPTCHA_KEY:
-        return jsonify({'error': 'Servicio SAT no configurado — contacta al administrador'}), 503
     _cleanup_old_jobs()
     job_id = str(uuid.uuid4())
     _job_create(job_id, {'status': 'running', 'result': None, 'error': None,
