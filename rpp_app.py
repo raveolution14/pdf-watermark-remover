@@ -5,6 +5,7 @@ Google OAuth · Stripe subscriptions (MXN) · Anti-sharing session
 """
 
 import io, threading, webbrowser, os, uuid, time, sqlite3, functools, json
+import re as _re_login
 from collections import defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo as _ZoneInfo
@@ -6600,6 +6601,8 @@ def _retry_rpp(func, max_retries=2, backoff_base=3):
         for attempt in range(1, max_retries + 2):  # 1 try + max_retries
             try:
                 return func(*args, **kwargs)
+            except RppLoginError:
+                raise
             except ValueError as e:
                 err_msg = str(e)
                 # Don't retry "not found" type errors — they're legitimate
@@ -6659,8 +6662,103 @@ def _navigate_to_consulta(page):
     """)
 
 
+# RPP keeps the login window in the DOM after a successful login, so presence of
+# input[type=password] is not a failure signal — visibility is.
+_PWD_VISIBLE_JS = """
+(() => {
+    const ins = Array.from(document.querySelectorAll("input[type=password]"));
+    return ins.some(i => i.offsetParent !== null && i.getClientRects().length > 0);
+})()
+"""
+
+# Text of any visible ExtJS dialog, so a rejected login reports the real reason.
+_LOGIN_MSG_JS = """
+(() => {
+    const seen = [];
+    try {
+        if (typeof Ext !== "undefined" && Ext.ComponentQuery) {
+            for (const mb of Ext.ComponentQuery.query("messagebox")) {
+                if (mb.isVisible && mb.isVisible(true) && mb.el && mb.el.dom)
+                    seen.push(mb.el.dom.innerText || "");
+            }
+        }
+    } catch (e) {}
+    for (const n of document.querySelectorAll(".x-message-box")) {
+        if (n.offsetParent !== null) seen.push(n.innerText || "");
+    }
+    const t = seen.map(s => s.replace(/\s+/g, " ").trim()).filter(Boolean);
+    return t.length ? t[0].slice(0, 300) : "";
+})()
+"""
+
+_DISMISS_MSG_JS = """
+(() => {
+    let n = 0;
+    try {
+        for (const mb of Ext.ComponentQuery.query("messagebox")) {
+            if (!(mb.isVisible && mb.isVisible(true))) continue;
+            const b = (mb.query("button") || []).find(x => x.isVisible && x.isVisible(true));
+            if (b && b.el) { b.el.dom.click(); n++; }
+            else if (mb.hide) { mb.hide(); n++; }
+        }
+    } catch (e) {}
+    return n;
+})()
+"""
+
+# Dialogs that no amount of retrying will get past.
+_LOGIN_FATAL_RE = _re_login.compile(
+    r'incorrect|inv[aá]lid|no\s+v[aá]lid|bloquead|deshabilitad|caduc|expirad|'
+    r'no\s+autoriz|sin\s+permiso|sesi[oó]n\s+(activa|iniciada|abierta)|'
+    r'usuario\s+no\s+existe',
+    _re_login.I)
+
+
+class RppLoginError(ValueError):
+    """RPP refused the credentials — retrying with the same ones cannot help."""
+
+
+def _rpp_submit_login(page, pwd_id, attempt):
+    """Submit the login form once, rotating strategies between attempts."""
+    mode = attempt % 3
+    if mode == 1:
+        btn_id = page.evaluate("""
+            (() => {
+                const lb = Ext.ComponentQuery.query("button[text=Aceptar]").find(b => !b.up("messagebox"));
+                return lb && lb.el ? lb.getId() : "";
+            })()
+        """)
+        if btn_id:
+            try:
+                page.click(f'#{btn_id}', timeout=3000)
+                return 'native-click'
+            except Exception:
+                pass
+    if mode == 2:
+        try:
+            page.press(f'#{pwd_id}', 'Enter')
+            return 'enter'
+        except Exception:
+            pass
+    ok = page.evaluate("""
+        (() => {
+            const lb = Ext.ComponentQuery.query("button[text=Aceptar]").find(b => !b.up("messagebox"));
+            if (!lb || !lb.el) return false;
+            const d = lb.el.dom;
+            for (const t of ["mousedown", "mouseup", "click"])
+                d.dispatchEvent(new MouseEvent(t, {bubbles: true, view: window}));
+            return true;
+        })()
+    """)
+    return 'ext-dom' if ok else 'none'
+
+
 def _login_and_open_consulta(page):
-    """Login RPP and click the Consulta Avanzada tile."""
+    """Login RPP and click the Consulta Avanzada tile.
+
+    Retries the submit with a different strategy while the login window is still
+    showing, and surfaces the site's own error dialog instead of a bare timeout.
+    """
     page.goto(RPP_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_function(
         '() => typeof Ext !== "undefined" && Ext.ComponentQuery &&'
@@ -6669,26 +6767,41 @@ def _login_and_open_consulta(page):
     )
     user_id = page.evaluate('Ext.ComponentQuery.query("textfield[name=userName]")[0].getInputId()')
     pwd_id  = page.evaluate('Ext.ComponentQuery.query("textfield[name=password]")[0].getInputId()')
-    page.fill(f'#{user_id}', RPP_USER)
-    page.fill(f'#{pwd_id}',  RPP_PASS)
-    page.wait_for_timeout(300)
-    page.evaluate("""
-        const lb = Ext.ComponentQuery.query("button[text=Aceptar]").find(b => !b.up("messagebox"));
-        if (lb && lb.el) {
-            const d = lb.el.dom;
-            d.dispatchEvent(new MouseEvent("mousedown", {bubbles:true,view:window}));
-            d.dispatchEvent(new MouseEvent("mouseup",   {bubbles:true,view:window}));
-            d.dispatchEvent(new MouseEvent("click",     {bubbles:true,view:window}));
-        }
-    """)
-    page.wait_for_timeout(800)
-    if page.evaluate('!!document.querySelector("input[type=password]")'):
-        page.press(f'#{pwd_id}', 'Enter')
-    try:
-        page.wait_for_function('() => !document.querySelector("input[type=password]")', timeout=30000)
-    except Exception:
-        raise ValueError("STEP2: login no completó (password field sigue visible)")
-    _navigate_to_consulta(page)
+
+    deadline = time.time() + 40
+    last_msg = ''
+    attempt  = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            page.fill(f'#{user_id}', RPP_USER)
+            page.fill(f'#{pwd_id}',  RPP_PASS)
+        except Exception:
+            if not page.evaluate(_PWD_VISIBLE_JS):
+                _navigate_to_consulta(page)
+                return
+            raise
+        page.wait_for_timeout(300)
+        how = _rpp_submit_login(page, pwd_id, attempt)
+        print(f'[RPP] login intento {attempt} via {how}', flush=True)
+        # Give this strategy a bounded window, then fall through to the next one.
+        wait_until = min(deadline, time.time() + 8)
+        while time.time() < wait_until:
+            page.wait_for_timeout(500)
+            if not page.evaluate(_PWD_VISIBLE_JS):
+                _navigate_to_consulta(page)
+                return
+            msg = page.evaluate(_LOGIN_MSG_JS)
+            if not msg:
+                continue
+            last_msg = msg
+            if _LOGIN_FATAL_RE.search(msg):
+                raise RppLoginError(f'RPP rechazó el acceso: {msg}')
+            page.evaluate(_DISMISS_MSG_JS)
+            break
+
+    detail = f' — el sitio respondió: "{last_msg}"' if last_msg else ''
+    raise ValueError(f'STEP2: login no completó tras {attempt} intento(s){detail}')
 
 
 # ── Folio search ───────────────────────────────────────────────────────────────
