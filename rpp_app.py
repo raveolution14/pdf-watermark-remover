@@ -6641,8 +6641,33 @@ def _ext_dom_click(page, btn_text: str):
     """)
 
 
+# Clicks the idx-th "Consulta de Tramites" candidate and returns its label.
+_CONSULTA_CLICK_JS = """
+(idx) => {
+    const cands = Array.from(document.querySelectorAll("*"))
+        .filter(e => e.offsetParent !== null &&
+                     e.textContent.toLowerCase().includes("consulta") &&
+                     e.textContent.toLowerCase().includes("tramites"))
+        .sort((a, b) => a.textContent.length - b.textContent.length);
+    const el = cands[idx];
+    if (!el) return "";
+    el.click();
+    return (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60) || "(sin texto)";
+}
+"""
+
+_FOLIO_FIELD_JS = ('() => { try { return Ext.ComponentQuery'
+                   '.query("numberfield[name=FOLIOREAL]").length > 0; }'
+                   ' catch (e) { return false; } }')
+
+
 def _navigate_to_consulta(page):
-    """From the RPP main menu, click into Consulta de Tramites."""
+    """From the RPP main menu, open Consulta de Tramites and confirm it opened.
+
+    The menu entry is matched by text, so the shortest match is not always the
+    clickable one — each candidate is verified against the folio field before
+    giving up.
+    """
     try:
         page.wait_for_function(
             '() => Array.from(document.querySelectorAll("*")).some('
@@ -6653,13 +6678,20 @@ def _navigate_to_consulta(page):
         )
     except Exception:
         raise ValueError("STEP3: menú principal no apareció")
-    page.evaluate("""
-        const el = Array.from(document.querySelectorAll("*"))
-            .filter(e => e.textContent.toLowerCase().includes("consulta") &&
-                         e.textContent.toLowerCase().includes("tramites"))
-            .sort((a, b) => a.textContent.length - b.textContent.length)[0];
-        if (el) el.click();
-    """)
+
+    tried = []
+    for idx in range(3):
+        label = page.evaluate(_CONSULTA_CLICK_JS, idx)
+        if not label:
+            break
+        tried.append(label)
+        try:
+            page.wait_for_function(_FOLIO_FIELD_JS, timeout=8000)
+            return
+        except Exception:
+            continue
+    raise ValueError('STEP3: no se abrió Consulta de Tramites (clicks: %s)'
+                     % (' | '.join(tried) or 'ningún candidato'))
 
 
 # RPP keeps the login window in the DOM after a successful login, so presence of
@@ -10165,6 +10197,135 @@ def pool_stats():
         'cache_disk': disk_count,
         'cache_ttl_hours': PDF_CACHE_TTL // 3600,
     })
+
+
+@app.route('/admin/rpp-debug')
+@login_required
+def admin_rpp_debug():
+    """Run the RPP login step by step and report where it stops.
+
+    Admin only. Opens the real site, tries each submit strategy, and reports the
+    dialog text, the menu options it can see and whether the folio form appeared.
+    Add ?json=1 for the raw payload.
+    """
+    u = current_user()
+    if u['role'] != 'admin':
+        return jsonify({'error': 'No autorizado'}), 403
+
+    import base64
+    _t0     = time.time()
+    steps   = []
+    console = []
+    shot    = None
+    ok      = False
+    error   = ''
+
+    def _step(name, **info):
+        steps.append(dict(paso=name, t=round(time.time() - _t0, 1), **info))
+
+    _VISIBLE_TEXT_JS = """
+        (() => {
+            const out = [];
+            for (const e of document.querySelectorAll("a,button,span,div,td,li")) {
+                if (e.children.length) continue;
+                if (e.offsetParent === null) continue;
+                const t = (e.innerText || "").replace(/\s+/g, " ").trim();
+                if (t && t.length < 60 && !out.includes(t)) out.push(t);
+                if (out.length >= 40) break;
+            }
+            return out;
+        })()
+    """
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+            context = browser.new_context(ignore_https_errors=True, user_agent=_USER_AGENT)
+            page    = context.new_page()
+            page.set_default_timeout(45000)
+            page.on('console',   lambda m: console.append(f'{m.type}: {m.text}'[:200]))
+            page.on('pageerror', lambda e: console.append(f'pageerror: {e}'[:200]))
+            try:
+                page.goto(RPP_URL, wait_until='domcontentloaded', timeout=60000)
+                _step('abrir sitio', url=page.url, titulo=page.title())
+
+                try:
+                    page.wait_for_function(
+                        '() => typeof Ext !== "undefined" && Ext.ComponentQuery &&'
+                        ' Ext.ComponentQuery.query("textfield[name=userName]").length > 0',
+                        timeout=40000)
+                    _step('formulario de login', encontrado=True)
+                except Exception:
+                    _step('formulario de login', encontrado=False,
+                          ext=page.evaluate('typeof Ext'),
+                          inputs=page.evaluate('document.querySelectorAll("input").length'),
+                          textos=page.evaluate(_VISIBLE_TEXT_JS))
+                    raise ValueError('el formulario de login nunca cargó')
+
+                user_id = page.evaluate('Ext.ComponentQuery.query("textfield[name=userName]")[0].getInputId()')
+                pwd_id  = page.evaluate('Ext.ComponentQuery.query("textfield[name=password]")[0].getInputId()')
+                page.fill(f'#{user_id}', RPP_USER)
+                page.fill(f'#{pwd_id}',  RPP_PASS)
+                _step('capturar credenciales', usuario=RPP_USER, largo_password=len(RPP_PASS))
+
+                for attempt in (1, 2, 3):
+                    how = _rpp_submit_login(page, pwd_id, attempt)
+                    page.wait_for_timeout(4000)
+                    visible = page.evaluate(_PWD_VISIBLE_JS)
+                    msg     = page.evaluate(_LOGIN_MSG_JS)
+                    _step('enviar login', intento=attempt, metodo=how,
+                          password_visible=visible, dialogo=msg)
+                    if not visible:
+                        break
+                    if msg:
+                        page.evaluate(_DISMISS_MSG_JS)
+
+                if page.evaluate(_PWD_VISIBLE_JS):
+                    raise ValueError('el login no pasó — la ventana de acceso sigue visible')
+
+                _step('menú principal', opciones=page.evaluate(_VISIBLE_TEXT_JS))
+                _navigate_to_consulta(page)
+                page.wait_for_timeout(3000)
+                folio_fields = page.evaluate(
+                    '(() => { try { return Ext.ComponentQuery.query("numberfield[name=FOLIOREAL]").length; }'
+                    '         catch (e) { return -1; } })()')
+                _step('consulta de trámites', campos_folio=folio_fields,
+                      textos=page.evaluate(_VISIBLE_TEXT_JS))
+                ok = folio_fields > 0
+                if not ok:
+                    error = 'el formulario de folio no apareció tras entrar a Consulta de Tramites'
+            except Exception as e:
+                error = str(e) or e.__class__.__name__
+            finally:
+                try:
+                    shot = base64.b64encode(page.screenshot()).decode()
+                except Exception:
+                    pass
+                browser.close()
+    except Exception as e:
+        error = f'no se pudo abrir el navegador: {e}'
+
+    payload = {'ok': ok, 'error': error, 'pasos': steps, 'consola': console[-15:]}
+    if request.args.get('json'):
+        return jsonify(payload)
+
+    rows = ''.join(
+        '<tr><td>{}</td><td>{}s</td><td><pre>{}</pre></td></tr>'.format(
+            st['paso'], st['t'],
+            json.dumps({k: v for k, v in st.items() if k not in ('paso', 't')},
+                       ensure_ascii=False, indent=1))
+        for st in steps)
+    img = f'<img src="data:image/png;base64,{shot}" style="max-width:100%;border:1px solid #333">' if shot else ''
+    head = ('<h2 style="color:#4ade80">✅ El flujo llegó al formulario de folio</h2>'
+            if ok else f'<h2 style="color:#f87171">❌ {error or "falló"}</h2>')
+    return (
+        '<body style="background:#0a0a12;color:#e5e7eb;font-family:system-ui;padding:1rem">'
+        '<h1>Diagnóstico RPP</h1>' + head +
+        '<table border=1 cellpadding=6 style="border-collapse:collapse;font-size:.8rem">'
+        '<tr><th>Paso</th><th>t</th><th>Detalle</th></tr>' + rows + '</table>'
+        '<h3>Consola del navegador</h3><pre style="font-size:.75rem;white-space:pre-wrap">' +
+        ('\n'.join(console[-15:]) or 'sin mensajes') + '</pre>'
+        '<h3>Captura final</h3>' + img + '</body>')
 
 
 @app.route('/admin/realtime-metrics')
